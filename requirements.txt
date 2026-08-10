@@ -1,0 +1,43 @@
+# MktScan — slim production requirements for Railway deployment
+
+# Core scraping
+yfinance>=0.2.36
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
+
+# Data processing — use slim builds
+pandas>=2.1.0
+numpy>=1.26.0
+
+# Sentiment — FinBERT (primary) + VADER (fallback)
+vaderSentiment>=3.3.2
+transformers>=4.35.0
+torch>=2.0.0
+# Note: torch is large (~2GB). Railway free tier may need to use vader instead.
+# To use VADER, set sentiment.model = "vader" in config.yaml
+
+# Scheduling
+apscheduler>=3.10.0
+
+# Storage
+sqlalchemy>=2.0.0
+psycopg2-binary>=2.9.9
+# Schema migrations. Required: create_all() only creates whole tables and never
+# adds a column, so without migrations any column added after a database was
+# first created is silently absent. Run `alembic upgrade head` after pulling.
+alembic>=1.13.0
+
+# Dashboard
+streamlit>=1.29.0
+plotly>=5.18.0
+
+# Config & utilities
+pyyaml>=6.0.1
+click>=8.1.7
+rich>=13.7.0
+tenacity>=8.2.3
+python-dotenv>=1.0.0
+
+# OpenAI (optional — only used if sentiment.model = openai)
+openai>=1.6.0

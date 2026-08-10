@@ -1,0 +1,49 @@
+# MktScan — Railway deployment requirements.
+#
+# Identical to requirements.txt except that torch and transformers are omitted.
+#
+# Why: torch is ~2.5GB installed. On Railway that means a very slow build, an
+# image near or over the size limit, and a container that needs ~2GB RAM just to
+# hold FinBERT's weights. build_scorer() falls back to VADER automatically when
+# transformers is unavailable, so the app runs correctly without them — it just
+# scores sentiment with VADER instead of FinBERT.
+#
+# Sentiment is only 12% of the composite weight, so this is a smaller quality
+# hit than it sounds. If you want FinBERT-grade sentiment on Railway, set
+# MKTSCAN_SENTIMENT_MODEL=openai and MKTSCAN_OPENAI_KEY instead — comparable
+# quality, no 2.5GB dependency, roughly $0.001 per article batch.
+
+# Core scraping
+yfinance>=0.2.36
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
+
+# Data processing
+pandas>=2.1.0
+numpy>=1.26.0
+
+# Sentiment — VADER only (see note above)
+vaderSentiment>=3.3.2
+
+# Scheduling
+apscheduler>=3.10.0
+
+# Storage
+sqlalchemy>=2.0.0
+psycopg2-binary>=2.9.9
+alembic>=1.13.0
+
+# Dashboard
+streamlit>=1.29.0
+plotly>=5.18.0
+
+# Config & utilities
+pyyaml>=6.0.1
+click>=8.1.7
+rich>=13.7.0
+tenacity>=8.2.3
+python-dotenv>=1.0.0
+
+# OpenAI (used when MKTSCAN_SENTIMENT_MODEL=openai)
+openai>=1.6.0

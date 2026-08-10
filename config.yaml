@@ -1,0 +1,134 @@
+# MktScan Configuration
+
+scraper:
+  delay_seconds: 1.0           # Polite delay between requests
+  max_articles_per_source: 20  # Cap per source per run
+  lookback_days: 7             # How far back to search for news
+  # Every 30 minutes during US market hours on weekdays (13:00-21:00 UTC ≈
+  # 09:00-17:00 ET). The previous "*/15 * * * *" ran 96 times a day including
+  # overnight and weekends, when neither prices nor news change — and each run
+  # re-fetched every source for every ticker. Predictions and IV snapshots are
+  # deduplicated to one per day regardless, so the extra runs bought nothing.
+  schedule: "*/30 13-21 * * 1-5"
+  user_agent: "MktScan/1.0 (personal research tool)"
+  timeout_seconds: 15
+
+sources:
+  yahoo_finance:
+    enabled: true              # Essential — prices, news, earnings. Never disable.
+    method: yfinance
+    fetch_prices: true
+    fetch_news: true
+    fetch_earnings: true
+
+  alpha_vantage:
+    enabled: false             # STEP 1: get free key at alphavantage.co (30 seconds)
+    method: api                # STEP 2: paste key below and change enabled to true
+    api_key: "YOUR_AV_KEY"
+    base_url: "https://www.alphavantage.co/query"
+    fetch_prices: true
+    fetch_earnings: true
+    fetch_news: true
+
+  benzinga:
+    enabled: false             # Enable when you have Benzinga Pro (~$50/mo)
+    method: api
+    api_key: "YOUR_BENZINGA_KEY"
+    base_url: "https://api.benzinga.com/api/v2"
+    fetch_news: true
+    fetch_earnings: true
+    fetch_ratings: true
+
+  finviz:
+    enabled: false             # Disabled — free tier adds noise, not signal
+    method: scrape
+    session_cookie: ""         # Re-enable with Elite cookie for screener data
+    base_url: "https://finviz.com"
+    fetch_screener: true
+    fetch_news: true
+    fetch_ratings: true
+
+  wsj:
+    enabled: false             # Requires WSJ+ subscription ($39/mo)
+    method: scrape
+    session_cookie: "YOUR_WSJ_SESSION_COOKIE"
+    base_url: "https://www.wsj.com"
+    fetch_news: true
+    fetch_analysis: true
+
+  # NOTE: this source is named "reuters" for backwards compatibility with the
+  # database `source` column, but none of these feeds are Reuters — they are Dow
+  # Jones/WSJ, NYT and MarketWatch. It was nonetheless given a 1.3x weight for
+  # "Reuters editorial quality" and described as Reuters on the Data Definitions
+  # page. The display name below is what the dashboard now shows.
+  reuters:
+    enabled: true
+    display_name: "Wire feeds (WSJ / NYT / MarketWatch)"
+    feed_urls:
+      - "https://feeds.a.dj.com/rss/RSSMarketsMain.xml"
+      - "https://feeds.a.dj.com/rss/RSSWorldNews.xml"
+      - "https://feeds.a.dj.com/rss/RSSWSJD.xml"
+      - "https://rss.nytimes.com/services/xml/rss/nyt/Business.xml"
+      - "https://rss.nytimes.com/services/xml/rss/nyt/Technology.xml"
+      - "https://feeds.content.dowjones.io/public/rss/mw_realtimeheadlines"
+    fetch_macro: true
+
+  finnhub:
+    enabled: false             # STEP 1: get free key at finnhub.io (30 seconds)
+    api_key: "YOUR_FINNHUB_KEY"  # STEP 2: paste key here and set enabled: true
+    fetch_news: true
+    fetch_earnings: true
+
+  marketwatch:
+    enabled: true              # Economic calendar only — news blocked on cloud IPs
+    method: scrape
+    fetch_news: false          # Disabled — MarketWatch blocks cloud servers
+    fetch_economic_calendar: true
+
+sentiment:
+  model: "finbert"             # finbert | vader | openai — finbert is more accurate for financial text
+  finbert_model: "ProsusAI/finbert"
+  openai_api_key: "YOUR_OPENAI_KEY"
+  openai_model: "gpt-4o-mini"
+  max_text_length: 512
+  batch_size: 16
+
+storage:
+  type: sqlite
+  sqlite_path: "./data/mktscan.db"
+  postgres_dsn: "postgresql://user:pass@localhost:5432/mktscan"
+
+# ── Secrets ───────────────────────────────────────────────────────────────────
+# Do NOT put real credentials in this file — it is committed to the repo.
+# Every secret below is read from the environment instead:
+#
+#   export MKTSCAN_AV_KEY="..."          # Alpha Vantage
+#   export MKTSCAN_BENZINGA_KEY="..."    # Benzinga Pro
+#   export MKTSCAN_FINNHUB_KEY="..."     # Finnhub
+#   export MKTSCAN_FINVIZ_COOKIE="..."   # FinViz Elite session cookie
+#   export MKTSCAN_WSJ_COOKIE="..."      # WSJ+ session cookie
+#   export MKTSCAN_OPENAI_KEY="sk-..."   # OpenAI (only if sentiment.model=openai)
+#   export MKTSCAN_SMTP_PASSWORD="..."   # Gmail app password for alerts
+#   export MKTSCAN_SLACK_WEBHOOK="..."   # Slack incoming webhook
+#   export DATABASE_URL="postgresql://..."  # overrides storage.* entirely
+#
+# Any placeholder left below is blanked at load time, so an unset credential
+# disables its source rather than being sent to a live API.
+
+alerts:
+  enabled: false
+  sentiment_threshold_bull: 0.6
+  sentiment_threshold_bear: -0.3
+  email:
+    smtp_host: "smtp.gmail.com"
+    smtp_port: 587
+    from_addr: "you@gmail.com"
+    to_addr: "you@gmail.com"
+    password: ""               # set MKTSCAN_SMTP_PASSWORD
+  slack_webhook: ""            # set MKTSCAN_SLACK_WEBHOOK
+
+logging:
+  level: INFO
+  log_file: "./logs/mktscan.log"
+  max_bytes: 10485760
+  backup_count: 5

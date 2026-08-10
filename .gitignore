@@ -1,0 +1,28 @@
+# Secrets — never commit these
+config.local.yaml
+.env
+
+# Data
+data/
+logs/
+*.db
+*.sqlite
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+venv/
+.venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Streamlit
+
+# OS
+.DS_Store
+Thumbs.db

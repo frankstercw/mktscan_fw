@@ -1,0 +1,36 @@
+# Keeps build context small and, more importantly, keeps local secrets and a
+# local SQLite database out of the image. Without this, `config.local.yaml` and
+# `data/mktscan.db` are copied into the container by `COPY . .` — the config
+# would then override the environment-variable settings the deployment relies on.
+config.local.yaml
+.env
+.env.*
+
+data/
+logs/
+*.db
+*.sqlite
+*.sqlite3
+
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+venv/
+.venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+.git/
+.github/
+.gitignore
+*.md
+!README.md
+
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

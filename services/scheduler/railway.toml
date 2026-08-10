@@ -1,0 +1,30 @@
+# Point the service at this file via
+#   Settings → Config-as-code → Railway Config File = /services/scheduler/railway.toml
+# The absolute path is required: Railway only auto-detects railway.toml at the
+# repo root, and the config path does not follow the Root Directory setting.
+# Values here override the dashboard UI.
+
+[build]
+builder = "dockerfile"
+dockerfilePath = "Dockerfile.scheduler"
+# Only rebuild when something the worker actually uses changes — dashboard-only
+# edits should not restart the scheduler and re-trigger the IV seed check.
+watchPatterns = [
+  "mktscan/**",
+  "migrations/**",
+  "scripts/**",
+  "requirements*.txt",
+  "Dockerfile.scheduler",
+  "alembic.ini",
+  "config.yaml",
+]
+
+[deploy]
+startCommand = "./scripts/start-scheduler.sh"
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 3
+# Must stay at 1. Two schedulers would double every scrape, and while the
+# per-day unique constraints on predictions and IV snapshots would prevent
+# duplicate rows, both replicas would still hammer Yahoo on the same cadence and
+# invite rate limiting.
+numReplicas = 1
