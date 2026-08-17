@@ -343,6 +343,77 @@ class IVSnapshot(Base):
     def __repr__(self):
         return f"<IVSnapshot {self.ticker} {self.snapshot_date} iv={self.iv_used}>"
 
+
+
+class HistoricalOptionQuote(Base):
+    """Normalized historical EOD option quote, initially sourced from ORATS."""
+    __tablename__ = "historical_option_quotes"
+
+    id               = Column(Integer, primary_key=True, autoincrement=True)
+    ticker           = Column(String(10), nullable=False)
+    trade_date       = Column(Date, nullable=False)
+    expiration       = Column(Date, nullable=False)
+    strike           = Column(Float, nullable=False)
+    right            = Column(String(1), nullable=False)  # C | P
+    underlying_price = Column(Float)
+    bid              = Column(Float)
+    ask              = Column(Float)
+    model_value      = Column(Float)
+    volume           = Column(Integer)
+    open_interest    = Column(Integer)
+    implied_volatility = Column(Float)
+    delta            = Column(Float)
+    gamma            = Column(Float)
+    theta            = Column(Float)
+    vega             = Column(Float)
+    source           = Column(String(30), nullable=False, default="ORATS_EOD")
+    created_at       = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "ticker", "trade_date", "expiration", "strike", "right", "source",
+            name="uq_hist_option_quote",
+        ),
+        Index("ix_hist_option_ticker_date", "ticker", "trade_date"),
+        Index("ix_hist_option_contract", "ticker", "expiration", "strike", "right"),
+    )
+
+
+class OptionsMarketSnapshot(Base):
+    """Daily options-market state used for display, research, and later validation."""
+    __tablename__ = "options_market_snapshots"
+
+    id            = Column(Integer, primary_key=True, autoincrement=True)
+    ticker        = Column(String(10), nullable=False)
+    snapshot_date = Column(Date, nullable=False)
+    snapped_at    = Column(DateTime, default=datetime.utcnow)
+    source        = Column(String(30), nullable=False)
+    spot          = Column(Float)
+
+    atm_iv        = Column(Float)
+    iv_rank_1y    = Column(Float)
+    iv_percentile_1y = Column(Float)
+    iv_30d        = Column(Float)
+    iv_60d        = Column(Float)
+    iv_90d        = Column(Float)
+    term_slope_30_60 = Column(Float)
+    term_slope_60_90 = Column(Float)
+    term_state    = Column(String(30))
+
+    put_25d_iv    = Column(Float)
+    call_25d_iv   = Column(Float)
+    put_skew      = Column(Float)
+    call_skew     = Column(Float)
+    expected_move_pct = Column(Float)
+    expected_move_dollars = Column(Float)
+    confidence    = Column(Float)
+    components    = Column(Text)
+
+    __table_args__ = (
+        UniqueConstraint("ticker", "snapshot_date", name="uq_options_market_ticker_date"),
+        Index("ix_options_market_ticker_date", "ticker", "snapshot_date"),
+    )
+
 # ── Engine & session factory ──────────────────────────────────────────────────
 
 _engine = None

@@ -96,6 +96,13 @@ class BacktestObservation(Base):
     option_pnl_pct = Column(Float)           # % return on capital at risk
     option_win     = Column(Boolean)
     realized_vol   = Column(Float)
+    # Backtest v2: exact historical option structure from ORATS when available.
+    option_data_source = Column(String(30))
+    option_expiration  = Column(Date)
+    option_long_strike = Column(Float)
+    option_short_strike = Column(Float)
+    option_entry_debit = Column(Float)
+    option_exit_value  = Column(Float)
 
     created_at = Column(DateTime, default=datetime.utcnow)
 

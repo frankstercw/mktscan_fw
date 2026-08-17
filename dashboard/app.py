@@ -170,7 +170,7 @@ with st.sidebar:
 
     page = st.radio(
         "Navigation",
-        ["Dashboard", "Tradeability", "News Feed", "Earnings", "Economic Calendar", "Basket", "Backtest", "Data Definitions", "Run Scraper"],
+        ["Dashboard", "Tradeability", "Options Market", "News Feed", "Earnings", "Economic Calendar", "Basket", "Backtest", "Data Definitions", "Run Scraper"],
         label_visibility="collapsed",
     )
 
@@ -2506,6 +2506,94 @@ elif page == "Basket":
                     st.rerun()
 
     session.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# OPTIONS MARKET PAGE
+# ═══════════════════════════════════════════════════════════════════════════════
+elif page == "Options Market":
+    st.title("Options Market v2")
+    st.caption(
+        "IV rank/percentile, volatility term structure, 25Δ skew, "
+        "and option-implied expected move from Yahoo today or ORATS when selected. This is research context and does not "
+        "change tradeability weights yet."
+    )
+    from mktscan.options_market import latest_options_market, refresh_options_market
+
+    om_session = get_session()
+    basket_om = get_basket(om_session)
+    om_tickers = [c.ticker for c in basket_om]
+    c1, c2, c3 = st.columns([3, 2, 1])
+    with c1:
+        selected_om = st.selectbox("Ticker", ["All"] + om_tickers, key="options_market_ticker")
+    with c2:
+        source_om = st.selectbox("Source", ["yahoo", "orats"], format_func=str.upper, key="options_market_source")
+    with c3:
+        st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+        refresh_om = st.button("Refresh", type="primary", use_container_width=True)
+
+    if refresh_om:
+        targets = om_tickers if selected_om == "All" else [selected_om]
+        try:
+            with st.spinner(f"Fetching ORATS options analytics for {len(targets)} ticker(s)…"):
+                refresh_options_market(om_session, targets, source=source_om)
+            st.success("Options-market snapshots refreshed.")
+        except Exception as exc:
+            st.error(f"Options-market refresh failed: {exc}")
+
+    rows = (latest_options_market(om_session) if selected_om == "All"
+            else [latest_options_market(om_session, selected_om)])
+    rows = [r for r in rows if r is not None]
+    om_session.close()
+
+    if not rows:
+        st.info(
+            "No options-market snapshots yet. Run `python -m mktscan options-market --refresh` "
+            "or use the button above. Yahoo requires no new key; ORATS requires `ORATS_API_TOKEN`."
+        )
+    else:
+        data = []
+        for r in rows:
+            data.append({
+                "Ticker": r.ticker,
+                "Date": r.snapshot_date,
+                "ATM IV": r.atm_iv * 100 if r.atm_iv is not None else None,
+                "IV Rank 1Y": r.iv_rank_1y,
+                "IV Percentile 1Y": r.iv_percentile_1y,
+                "IV 30D": r.iv_30d * 100 if r.iv_30d is not None else None,
+                "IV 60D": r.iv_60d * 100 if r.iv_60d is not None else None,
+                "IV 90D": r.iv_90d * 100 if r.iv_90d is not None else None,
+                "Term": r.term_state,
+                "Put 25Δ Skew": r.put_skew * 100 if r.put_skew is not None else None,
+                "Call 25Δ Skew": r.call_skew * 100 if r.call_skew is not None else None,
+                "Expected Move %": r.expected_move_pct,
+                "Expected Move $": r.expected_move_dollars,
+                "Source": r.source,
+            })
+        import pandas as _pd
+        om_df = _pd.DataFrame(data)
+        st.dataframe(
+            om_df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "ATM IV": st.column_config.NumberColumn(format="%.1f%%"),
+                "IV 30D": st.column_config.NumberColumn(format="%.1f%%"),
+                "IV 60D": st.column_config.NumberColumn(format="%.1f%%"),
+                "IV 90D": st.column_config.NumberColumn(format="%.1f%%"),
+                "Put 25Δ Skew": st.column_config.NumberColumn(format="%.2f"),
+                "Call 25Δ Skew": st.column_config.NumberColumn(format="%.2f"),
+                "Expected Move %": st.column_config.NumberColumn(format="%.1f%%"),
+                "Expected Move $": st.column_config.NumberColumn(format="$%.2f"),
+            },
+        )
+        if len(rows) == 1:
+            r = rows[0]
+            a, b, c, d = st.columns(4)
+            a.metric("IV Rank", f"{r.iv_rank_1y:.0f}" if r.iv_rank_1y is not None else "—")
+            b.metric("IV Percentile", f"{r.iv_percentile_1y:.0f}" if r.iv_percentile_1y is not None else "—")
+            c.metric("Term Structure", r.term_state or "—")
+            d.metric("Expected Move", f"±{r.expected_move_pct:.1f}%" if r.expected_move_pct is not None else "—")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

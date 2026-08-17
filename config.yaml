@@ -20,6 +20,14 @@ market_regime:
   history_period: "1y"
   breadth_universe: "basket"
 
+options_data:
+  # ORATS powers historical research/backtest v2. Current options-market analytics
+  # default to Yahoo so ORATS can remain a historical-only subscription.
+  enabled: true
+  auto_refresh_options_market: false
+  historical_provider: "orats"
+  live_provider: "yahoo"
+
 sources:
   yahoo_finance:
     enabled: true              # Essential — prices, news, earnings. Never disable.
@@ -115,6 +123,7 @@ storage:
 #   export MKTSCAN_FINVIZ_COOKIE="..."   # FinViz Elite session cookie
 #   export MKTSCAN_WSJ_COOKIE="..."      # WSJ+ session cookie
 #   export MKTSCAN_OPENAI_KEY="sk-..."   # OpenAI (only if sentiment.model=openai)
+#   export ORATS_API_TOKEN="..."          # ORATS historical/options analytics
 #   export MKTSCAN_SMTP_PASSWORD="..."   # Gmail app password for alerts
 #   export MKTSCAN_SLACK_WEBHOOK="..."   # Slack incoming webhook
 #   export DATABASE_URL="postgresql://..."  # overrides storage.* entirely

@@ -352,6 +352,22 @@ class ScrapeEngine:
                     session.rollback()
                     log.warning(f"[Regime] Refresh failed: {re}")
 
+            # ── Optional ORATS options-market refresh ────────────────────
+            # Disabled by default to avoid consuming a paid API unexpectedly.
+            options_cfg = self.cfg.get("options_data", {}) or {}
+            if (mode in ("all", "prices") and options_cfg.get("enabled", True)
+                    and options_cfg.get("auto_refresh_options_market", False)):
+                try:
+                    from .options_market import refresh_options_market
+                    om = refresh_options_market(
+                        session, [c.ticker for c in companies],
+                        source=options_cfg.get("live_provider", "yahoo"),
+                    )
+                    self._log("ok", f"  Options market: refreshed {len(om)} ORATS snapshots")
+                except Exception as oe:
+                    session.rollback()
+                    log.warning(f"[OptionsMarket] Refresh failed: {oe}")
+
             # ── Record today's composite score as a pending prediction ────
             # Once per run, and the outcome table enforces one row per ticker
             # per calendar day, so a 15-minute scheduler produces one

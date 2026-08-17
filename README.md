@@ -519,3 +519,10 @@ The scraper refreshes regime automatically in `all` and `prices` modes. A single
 `market_regime_snapshots` row is updated per US market date; daily prediction
 records also capture the contemporaneous regime label/score/confidence for later
 regime-conditioned validation.
+
+## ORATS options research layer
+
+MktScan supports an optional ORATS research layer for historical option chains,
+actual-chain option backtesting, and daily options-market analytics. Set
+`ORATS_API_TOKEN`, run `alembic upgrade head`, and see [`OPTIONS_DATA.md`](OPTIONS_DATA.md).
+Paid-provider calls are opt-in; automatic refresh is disabled by default.

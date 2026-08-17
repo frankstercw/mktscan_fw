@@ -216,6 +216,7 @@ def doctor(ctx):
         "earnings_events", "scraper_runs", "tradeability_outcomes",
         "iv_snapshots", "backtest_observations",
         "macro_events", "market_regime_snapshots",
+        "historical_option_quotes", "options_market_snapshots",
     ]
     try:
         present = set(sa_inspect(engine).get_table_names())
@@ -405,6 +406,106 @@ def setups(ctx, ticker):
         for warning in s.get("warnings", []):
             console.print(f"[yellow]  ⚠ {tk}: {warning}[/yellow]")
     console.print(f"\n[dim]{__import__('mktscan.options', fromlist=['DISCLAIMER']).DISCLAIMER}[/dim]")
+
+
+
+@cli.command("orats-chain")
+@click.argument("ticker")
+@click.argument("trade_date")
+@click.option("--min-dte", default=21, show_default=True, type=int)
+@click.option("--max-dte", default=60, show_default=True, type=int)
+@click.pass_context
+def orats_chain(ctx, ticker, trade_date, min_dte, max_dte):
+    """Fetch/cache one historical ORATS EOD chain (DATE=YYYY-MM-DD)."""
+    from datetime import datetime
+    from .database import init_db, get_session
+    from .providers.orats import OratsClient
+    from .backtest_options import get_historical_chain
+
+    dt = datetime.strptime(trade_date, "%Y-%m-%d").date()
+    init_db()
+    session = get_session()
+    try:
+        quotes = get_historical_chain(
+            session, OratsClient(), ticker.upper(), dt, min_dte, max_dte, refresh=True
+        )
+        expiries = len({q.expiration for q in quotes})
+        console.print(
+            f"[green]✓[/green] cached {len(quotes):,} normalized quotes "
+            f"across {expiries} expiries for {ticker.upper()} {dt}"
+        )
+    finally:
+        session.close()
+
+
+@cli.command("backtest-orats")
+@click.option("--ticker", default=None, help="Limit enrichment to one ticker")
+@click.option("--limit", default=100, show_default=True, type=int,
+              help="Maximum observations to enrich this run")
+@click.option("--holding-days", default=21, show_default=True, type=int)
+@click.pass_context
+def backtest_orats(ctx, ticker, limit, holding_days):
+    """Backtest v2: replace synthetic option P&L with historical ORATS quotes."""
+    from .database import init_db, get_session
+    from .backtest_options import enrich_backtest_with_orats
+
+    init_db()
+    session = get_session()
+    try:
+        result = enrich_backtest_with_orats(
+            session,
+            tickers=[ticker.upper()] if ticker else None,
+            limit=limit,
+            holding_days=holding_days,
+            progress_cb=_progress,
+        )
+        console.print(
+            f"[green]✓[/green] attempted {result['attempted']}; "
+            f"enriched {result['enriched']}; failed/no-chain {result['failed']}"
+        )
+    finally:
+        session.close()
+
+
+@cli.command("options-market")
+@click.option("--ticker", default=None, help="Limit to one ticker")
+@click.option("--refresh", is_flag=True, help="Fetch current options-market state")
+@click.option("--source", type=click.Choice(["yahoo", "orats"]), default="yahoo", show_default=True)
+@click.pass_context
+def options_market(ctx, ticker, refresh, source):
+    """Show/refresh Options Market v2 (IV rank, term structure, skew, expected move)."""
+    from .database import init_db, get_session, get_basket
+    from .options_market import latest_options_market, refresh_options_market
+
+    init_db()
+    session = get_session()
+    try:
+        tickers = [ticker.upper()] if ticker else [c.ticker for c in get_basket(session)]
+        if refresh:
+            console.print(f"[cyan]Refreshing {source.upper()} options market for {len(tickers)} ticker(s)…[/cyan]")
+            refresh_options_market(session, tickers, source=source)
+        rows = ([latest_options_market(session, ticker)] if ticker
+                else latest_options_market(session))
+        rows = [r for r in rows if r is not None]
+        if not rows:
+            console.print("[yellow]No options-market snapshots. Run with --refresh (Yahoo is the default; ORATS requires ORATS_API_TOKEN).[/yellow]")
+            return
+        table = Table(title="Options Market v2", header_style="bold cyan")
+        for col in ("Ticker", "ATM IV", "IV Rank", "IV Pct", "30/60/90 IV", "Term", "Put Skew", "Call Skew", "Exp Move"):
+            table.add_column(col)
+        for r in sorted(rows, key=lambda x: x.ticker):
+            pct = lambda v: f"{v*100:.1f}%" if v is not None else "—"
+            table.add_row(
+                r.ticker, pct(r.atm_iv),
+                f"{r.iv_rank_1y:.0f}" if r.iv_rank_1y is not None else "—",
+                f"{r.iv_percentile_1y:.0f}" if r.iv_percentile_1y is not None else "—",
+                "/".join(pct(v) for v in (r.iv_30d, r.iv_60d, r.iv_90d)),
+                r.term_state or "—", pct(r.put_skew), pct(r.call_skew),
+                f"±{r.expected_move_pct:.1f}%" if r.expected_move_pct is not None else "—",
+            )
+        console.print(table)
+    finally:
+        session.close()
 
 
 @cli.command()
