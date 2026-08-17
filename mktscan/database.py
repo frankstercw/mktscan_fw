@@ -214,12 +214,99 @@ class TradeabilityOutcome(Base):
     direction_correct    = Column(Boolean)                  # did sign of score match sign of return?
     magnitude_error      = Column(Float)                    # abs(expected_move - actual_move)
     run_id               = Column(Integer)
+    # Market context captured at prediction time. Context only: these fields do
+    # not alter the score; they make regime-conditioned validation possible.
+    regime_score_at_prediction      = Column(Float)
+    regime_label_at_prediction      = Column(String(40))
+    regime_confidence_at_prediction = Column(Float)
 
     __table_args__ = (
         UniqueConstraint("ticker", "prediction_date", name="uq_outcome_ticker_day"),
         Index("ix_outcome_ticker", "ticker"),
         Index("ix_outcome_predicted_at", "predicted_at"),
         Index("ix_outcome_ticker_date", "ticker", "prediction_date"),
+    )
+
+
+class MacroEvent(Base):
+    """Persisted macro calendar event used by the market-regime risk layer."""
+    __tablename__ = "macro_events"
+
+    id         = Column(Integer, primary_key=True, autoincrement=True)
+    source     = Column(String(30), nullable=False, default="marketwatch")
+    name       = Column(String(200), nullable=False)
+    category   = Column(String(50))
+    importance = Column(String(20))
+    event_at   = Column(DateTime, nullable=False)
+    period     = Column(String(50))
+    consensus  = Column(String(100))
+    prior      = Column(String(100))
+    actual     = Column(String(100))
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("source", "name", "event_at", name="uq_macro_source_name_time"),
+        Index("ix_macro_event_at", "event_at"),
+        Index("ix_macro_importance_at", "importance", "event_at"),
+    )
+
+
+class MarketRegimeSnapshot(Base):
+    """One updatable market-context snapshot per US market date."""
+    __tablename__ = "market_regime_snapshots"
+
+    id            = Column(Integer, primary_key=True, autoincrement=True)
+    snapshot_date = Column(Date, nullable=False, unique=True)
+    snapped_at    = Column(DateTime, default=datetime.utcnow)
+
+    regime_score  = Column(Float)
+    regime_label  = Column(String(40))
+    confidence    = Column(Float)
+    coverage      = Column(Float)
+    trend_score   = Column(Float)
+
+    spy_price       = Column(Float)
+    spy_return_20d  = Column(Float)
+    spy_return_60d  = Column(Float)
+    spy_trend_score = Column(Float)
+    qqq_price       = Column(Float)
+    qqq_return_20d  = Column(Float)
+    qqq_return_60d  = Column(Float)
+    qqq_trend_score = Column(Float)
+
+    vix                  = Column(Float)
+    vix_change_5d_pct    = Column(Float)
+    vix_percentile_20d   = Column(Float)
+    vix_percentile_1y    = Column(Float)
+    volatility_state     = Column(String(40))
+    volatility_score     = Column(Float)
+
+    breadth_above_20d      = Column(Float)
+    breadth_above_50d      = Column(Float)
+    breadth_above_200d     = Column(Float)
+    breadth_positive_5d    = Column(Float)
+    breadth_positive_20d   = Column(Float)
+    breadth_score          = Column(Float)
+    breadth_universe_size  = Column(Integer)
+
+    two_year_yield            = Column(Float)
+    ten_year_yield            = Column(Float)
+    curve_10y_2y              = Column(Float)
+    ten_year_5d_change_bps    = Column(Float)
+    ten_year_20d_change_bps   = Column(Float)
+    rates_score               = Column(Float)
+
+    next_macro_event      = Column(String(200))
+    next_macro_at         = Column(DateTime)
+    next_macro_importance = Column(String(20))
+    hours_to_macro        = Column(Float)
+    macro_risk_score      = Column(Float)
+
+    components = Column(Text)
+
+    __table_args__ = (
+        Index("ix_regime_snapshot_date", "snapshot_date"),
+        Index("ix_regime_snapped_at", "snapped_at"),
     )
 
 

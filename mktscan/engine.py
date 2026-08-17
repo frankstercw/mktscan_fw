@@ -119,6 +119,20 @@ class ScrapeEngine:
         self._reuters_cache    = None  # reset feed cache for fresh run
         self._finnhub_earnings_cache = None  # reset earnings cache for fresh run
 
+        # ── Refresh macro calendar once per run ─────────────────────────────
+        # This feeds the separate market-regime context layer. It intentionally
+        # does not alter tradeability scores.
+        if self.mw and mode in ("all", "prices"):
+            try:
+                self._log("info", "Macro calendar: refreshing high-impact events...")
+                from .macro import upsert_macro_events
+                macro_events = self.mw.fetch_economic_calendar()
+                saved = upsert_macro_events(session, macro_events)
+                self._log("ok", f"Macro calendar: {len(macro_events)} events ({saved} new)")
+            except Exception as e:
+                session.rollback()
+                log.warning(f"[Regime] Macro calendar refresh failed: {e}")
+
         # ── Pre-fetch Reuters feeds once before parallel ticker loop ──
         if self.reuters and mode in ("all", "news"):
             try:
@@ -321,6 +335,23 @@ class ScrapeEngine:
                         errors.append(f"Sentiment/{ticker}: {e}")
                         self._log("warn", f"  Sentiment error: {e}")
 
+            # ── Refresh market regime context ─────────────────────────────
+            # Stored separately from ticker scores so we can validate whether
+            # regime adds information before allowing it to change decisions.
+            regime_result = None
+            if mode in ("all", "prices") and self.cfg.get("market_regime", {}).get("enabled", True):
+                try:
+                    from .regime import refresh_market_regime
+                    regime_result = refresh_market_regime(session, [c.ticker for c in companies])
+                    self._log(
+                        "ok",
+                        f"  Regime: {regime_result['label']} "
+                        f"({regime_result['score']:+.2f}, conf {regime_result['confidence']:.0%})",
+                    )
+                except Exception as re:
+                    session.rollback()
+                    log.warning(f"[Regime] Refresh failed: {re}")
+
             # ── Record today's composite score as a pending prediction ────
             # Once per run, and the outcome table enforces one row per ticker
             # per calendar day, so a 15-minute scheduler produces one
@@ -337,6 +368,9 @@ class ScrapeEngine:
                             score=result["score"],
                             label=result["label"],
                             run_id=run_id,
+                            regime_score=(regime_result or {}).get("score") if 'regime_result' in locals() else None,
+                            regime_label=(regime_result or {}).get("label") if 'regime_result' in locals() else None,
+                            regime_confidence=(regime_result or {}).get("confidence") if 'regime_result' in locals() else None,
                         ):
                             recorded += 1
                     session.commit()
@@ -401,6 +435,7 @@ class ScrapeEngine:
             "tickers_scored":  tickers_scored,
             "sentiment":       sentiment_results,
             "tradeability":    tradeability_results,
+            "regime":          regime_result if 'regime_result' in locals() else None,
             "errors":          errors,
             "elapsed_seconds": elapsed,
         }

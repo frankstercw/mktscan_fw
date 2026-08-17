@@ -84,6 +84,9 @@ def record_prediction(
     label:        str,
     run_id:       int,
     horizon_days: int = DEFAULT_HORIZON_DAYS,
+    regime_score: float | None = None,
+    regime_label: str | None = None,
+    regime_confidence: float | None = None,
 ) -> bool:
     """
     Record today's score as a pending outcome — at most once per ticker per day.
@@ -113,6 +116,9 @@ def record_prediction(
             existing.label_at_prediction = label
             existing.predicted_at        = datetime.utcnow()
             existing.run_id              = run_id
+            existing.regime_score_at_prediction      = regime_score
+            existing.regime_label_at_prediction      = regime_label
+            existing.regime_confidence_at_prediction = regime_confidence
         return False
 
     session.add(TradeabilityOutcome(
@@ -123,6 +129,9 @@ def record_prediction(
         prediction_date     = today,
         horizon_days        = horizon_days,
         run_id              = run_id,
+        regime_score_at_prediction      = regime_score,
+        regime_label_at_prediction      = regime_label,
+        regime_confidence_at_prediction = regime_confidence,
     ))
     return True
 

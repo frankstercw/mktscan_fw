@@ -2,8 +2,8 @@ from setuptools import setup, find_packages
 
 setup(
     name="mktscan",
-    version="1.0.0",
-    description="Market Intelligence Scraper & Sentiment Engine",
+    version="2.0.0",
+    description="Market intelligence scanner and options setup engine",
     packages=find_packages(),
     python_requires=">=3.10",
     install_requires=[
@@ -19,6 +19,7 @@ setup(
         "vaderSentiment>=3.3.2",
         "apscheduler>=3.10.0",
         "sqlalchemy>=2.0.0",
+        "alembic>=1.13.0",
         "streamlit>=1.29.0",
         "plotly>=5.18.0",
         "pyyaml>=6.0.1",

@@ -24,7 +24,7 @@ from mktscan.database import (
     init_db, get_session, get_basket, get_latest_scores,
     get_score_history, get_recent_articles,
     SentimentScore, PriceSnapshot, EarningsEvent, ScraperRun,
-    Article, Company, seed_default_basket, upsert_company
+    Article, Company, MarketRegimeSnapshot, seed_default_basket, upsert_company
 )
 from sqlalchemy import select, desc, func
 from mktscan.tradeability import (
@@ -130,6 +130,20 @@ def results_digest(results: dict) -> str:
 
 
 @st.cache_data(ttl=300, show_spinner=False)
+def cached_market_regime():
+    """Latest persisted regime snapshot. No network calls on dashboard reruns."""
+    session = get_session()
+    try:
+        return session.execute(
+            select(MarketRegimeSnapshot)
+            .order_by(desc(MarketRegimeSnapshot.snapped_at))
+            .limit(1)
+        ).scalar_one_or_none()
+    finally:
+        session.close()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
 def cached_sidebar_stats() -> dict:
     """Sidebar counters. These ran a COUNT(*) over articles on every rerun of
     every page, including page switches that do not use them."""
@@ -196,6 +210,36 @@ class _AdhocPriceError(Exception):
     def __init__(self, ticker: str):
         self.ticker = ticker
         super().__init__(f"No price for {ticker}")
+
+
+def format_component_value(value) -> str:
+    """
+    Render a signal component for display, whatever its type.
+
+    Component dicts are deliberately heterogeneous — they carry the signed
+    sub-scores that drive the composite, but also context the user needs to
+    interpret them: `iv_basis` is a string ("chain" / "proxy" / "none"),
+    `mean_reversion_flag` is a bool, `earnings_days_away` is a count, and
+    `iv_percentile` is None until IV history exists.
+
+    Formatting them all with `:+.3f` crashes on the first string
+    (`ValueError: Unknown format code 'f' for object of type 'str'`) and on the
+    first None. Signed decimals are reserved for the actual float sub-scores,
+    where the sign carries meaning.
+    """
+    if value is None:
+        return "—"
+    if isinstance(value, bool):            # check before int — bool subclasses int
+        return "yes" if value else "no"
+    if isinstance(value, int):
+        # Plain integers — these are counts (days to earnings, history days,
+        # streak length), not signed scores, so a leading "+" would misread as
+        # bullishness. Negatives still print their minus sign naturally.
+        return str(value)
+    if isinstance(value, float):
+        # Only the float sub-scores get an explicit sign, where it means direction.
+        return f"{value:+.3f}"
+    return str(value)
 
 
 def sentiment_color(score: float) -> str:
@@ -364,6 +408,51 @@ if page == "Dashboard":
             st.rerun()   # refresh dashboard with fresh data
         except Exception as e:
             st.error(f"Run failed: {e}")
+
+    # ── Market regime context ───────────────────────────────────────────────
+    regime_row = cached_market_regime()
+    st.markdown("### Market Regime")
+    st.caption(
+        "Context only — this snapshot is recorded for validation and does not "
+        "modify tradeability scores, strategy selection, or sizing."
+    )
+    if regime_row is None:
+        st.info("No regime snapshot yet. Run the scraper in `all`/`prices` mode or `mktscan regime --refresh`.")
+    else:
+        label = (regime_row.regime_label or "UNKNOWN").replace("_", " ")
+        score = regime_row.regime_score
+        conf = regime_row.confidence
+        rg1, rg2, rg3, rg4, rg5, rg6 = st.columns(6)
+        rg1.metric("Regime", label)
+        rg2.metric("Score", f"{score:+.2f}" if score is not None else "—")
+        rg3.metric("Confidence", f"{conf:.0%}" if conf is not None else "—")
+        rg4.metric("VIX", f"{regime_row.vix:.1f}" if regime_row.vix is not None else "—",
+                   regime_row.volatility_state.replace("_", " ") if regime_row.volatility_state else None)
+        rg5.metric("Breadth > 50d", f"{regime_row.breadth_above_50d:.0f}%" if regime_row.breadth_above_50d is not None else "—",
+                   f"{regime_row.breadth_universe_size or 0} basket names")
+        macro_delta = None
+        if regime_row.hours_to_macro is not None:
+            macro_delta = f"in {regime_row.hours_to_macro:.0f}h"
+        rg6.metric("Next high-impact macro", regime_row.next_macro_event or "None", macro_delta)
+
+        with st.expander("Regime components", expanded=False):
+            rows = [
+                {"Component": "SPY trend", "Score": regime_row.spy_trend_score, "Detail": f"20d {regime_row.spy_return_20d:+.1f}%" if regime_row.spy_return_20d is not None else "—"},
+                {"Component": "QQQ trend", "Score": regime_row.qqq_trend_score, "Detail": f"20d {regime_row.qqq_return_20d:+.1f}%" if regime_row.qqq_return_20d is not None else "—"},
+                {"Component": "Volatility", "Score": regime_row.volatility_score, "Detail": regime_row.volatility_state or "—"},
+                {"Component": "Basket breadth", "Score": regime_row.breadth_score, "Detail": f">20d {regime_row.breadth_above_20d:.0f}% · >200d {regime_row.breadth_above_200d:.0f}%" if regime_row.breadth_above_20d is not None and regime_row.breadth_above_200d is not None else "—"},
+                {"Component": "Rates", "Score": regime_row.rates_score, "Detail": f"2Y {regime_row.two_year_yield:.2f}% · 10Y {regime_row.ten_year_yield:.2f}%" if regime_row.two_year_yield is not None and regime_row.ten_year_yield is not None else "—"},
+                {"Component": "Macro risk", "Score": regime_row.macro_risk_score, "Detail": regime_row.next_macro_event or "—"},
+            ]
+            df_regime = pd.DataFrame(rows)
+            df_regime["Score"] = df_regime["Score"].map(lambda x: f"{x:+.2f}" if pd.notna(x) else "—")
+            st.dataframe(df_regime, use_container_width=True, hide_index=True)
+            st.caption(
+                "Regime score weights: trend 45%, basket breadth 25%, volatility 20%, rates 10%. "
+                "Macro is a non-directional caution flag and is not included in the score."
+            )
+
+    st.divider()
 
     # ── Ad-hoc ticker analysis ───────────────────────────────────────────────
     with st.expander("🔍  Analyse a specific ticker", expanded=False):
@@ -1093,7 +1182,8 @@ elif page == "Tradeability":
                         continue
                     st.markdown(f"**{meta['label']}**")
                     comp_rows = [
-                        {"Component": k.replace("_", " ").title(), "Score": f"{v:+.3f}"}
+                        {"Component": k.replace("_", " ").title(),
+                         "Score": format_component_value(v)}
                         for k, v in comps.items()
                     ]
                     st.dataframe(pd.DataFrame(comp_rows), use_container_width=True, hide_index=True)

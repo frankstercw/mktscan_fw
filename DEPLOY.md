@@ -1,83 +1,57 @@
 # Deploying MktScan on Railway
 
-Three Railway services in one project, from one repo:
+Three services in one project, from one repo and **one Dockerfile**:
 
-| Service | What it is | Dockerfile | Replicas |
-|---|---|---|---|
-| **postgres** | Railway's managed Postgres | — | 1 |
-| **scheduler** | Background worker. Scrapes, scores, owns the schema. | `Dockerfile.scheduler` | **1 — do not scale** |
-| **dashboard** | Streamlit web UI, public URL | `Dockerfile` | 1 |
+| Service | Role | How it's set |
+|---|---|---|
+| **Postgres** | Railway managed database | Add from the canvas |
+| **scheduler** | Background worker. Scrapes, scores, owns the schema. | `MKTSCAN_ROLE=scheduler` |
+| **dashboard** | Streamlit web UI, public URL | `MKTSCAN_ROLE=dashboard` |
 
-Two things to know before you start, because they cause most first-deploy failures:
+Both app services build the same image. Which one a container becomes is decided at runtime by a single environment variable — no Dockerfile paths, no start commands, no config-as-code paths to get wrong.
 
-- **Postgres is mandatory, not optional.** The two services run in separate containers with separate filesystems. A SQLite file cannot be shared between them — each would silently get its own empty database and the dashboard would show nothing while the scheduler happily scraped into the void.
-- **Only the scheduler runs migrations.** If both services ran `alembic upgrade head` at boot they would contend for the same Postgres DDL lock, and the loser can end up with a half-applied migration. `start-dashboard.sh` waits for the schema instead.
+Two things to know:
 
-Budget roughly **20 minutes**, plus 10–15 minutes of unattended IV backfill on first boot.
+- **Postgres is mandatory.** The two services run in separate containers with separate filesystems. A SQLite file cannot be shared — each would silently get its own empty database.
+- **Only the scheduler migrates.** Two containers running `alembic upgrade head` against the same Postgres at boot contend for the DDL lock, and the loser can leave a partially applied migration.
 
 ---
 
-## Step 1 — Push the repo to GitHub
+## 1. Push to GitHub
 
-```bash
-cd mktscan-main
+```
+cd <your-project-folder>
 git init
 git add .
 git commit -m "MktScan"
-git remote add origin git@github.com:<you>/mktscan.git
+git branch -M main
+git remote add origin https://github.com/YOURNAME/YOURREPO.git
 git push -u origin main
 ```
 
-Before pushing, confirm you are not committing secrets:
+Before pushing, confirm no secrets are going up:
 
-```bash
+```
 git ls-files | grep -E 'config\.local\.yaml|\.env$'   # must return nothing
-grep -n 'password\|webhook\|api_key' config.yaml      # must show only empty strings
 ```
 
-`config.yaml` ships with every credential blank; they all come from environment variables. If you had previously pasted a real key in there, rotate it — it is in your git history now.
+`config.yaml` ships with every credential blank — they all come from environment variables.
 
----
+## 2. Create the project and database
 
-## Step 2 — Create the project and Postgres
+1. **railway.app** → New Project → Deploy from GitHub repo → your repo.
+   If your repo isn't listed, click **Configure GitHub App** and grant access to it, then **Refresh**.
+2. Rename the created service to `scheduler` (optional, cosmetic).
+3. Canvas → **New** → **Database** → **Add PostgreSQL**.
 
-1. Go to **railway.app** → **New Project** → **Deploy from GitHub repo** → pick your repo.
-2. Railway creates one service. Rename it **`scheduler`** (Settings → Service Name).
-3. In the project canvas: **New** → **Database** → **Add PostgreSQL**.
+## 3. Configure the scheduler
 
-Railway now exposes `DATABASE_URL` as a project variable. `mktscan/config.py` reads it, rewrites the legacy `postgres://` prefix that SQLAlchemy 2.x rejects, and switches storage to Postgres automatically. You do not need to set `storage.type`.
+Leave **all** build settings at their defaults. Railway will find the root `Dockerfile` on its own.
 
----
-
-## Step 3 — Configure the scheduler service
-
-The repo already contains the build and deploy settings as code, in `services/scheduler/railway.toml`. Point the service at it:
-
-**Settings → Config-as-code → Railway Config File**
+**Variables** → Raw Editor:
 
 ```
-/services/scheduler/railway.toml
-```
-
-The leading slash matters. Railway only auto-detects `railway.toml` at the repo root, and the config path deliberately does **not** follow the Root Directory setting — so a file in a subdirectory is ignored unless you give the absolute path. Config as code overrides whatever is set in the dashboard UI, so once this is set you configure the build and deploy behaviour by editing the toml, not by clicking.
-
-That file sets:
-
-| Field | Value |
-|---|---|
-| Builder | `dockerfile` |
-| Dockerfile Path | `Dockerfile.scheduler` |
-| Start Command | `./scripts/start-scheduler.sh` |
-| Restart Policy | On failure, max 3 |
-| Replicas | **1** |
-
-Keep replicas at 1. The per-day unique constraints would stop duplicate rows, but two schedulers would still hit Yahoo on the same cadence and get you rate limited.
-
-*If you would rather not use config as code*, leave the Railway Config File field blank and set Builder, Dockerfile Path and Start Command manually under **Settings → Build** and **Settings → Deploy** using the same values.
-
-**Variables** — click *Raw Editor* and paste:
-
-```bash
+MKTSCAN_ROLE=scheduler
 DATABASE_URL=${{Postgres.DATABASE_URL}}
 MKTSCAN_SENTIMENT_MODEL=vader
 MKTSCAN_SCHEDULE=*/30 13-21 * * 1-5
@@ -85,121 +59,97 @@ MKTSCAN_LOG_LEVEL=INFO
 TZ=UTC
 ```
 
-`${{Postgres.DATABASE_URL}}` is Railway's reference syntax — it links to the database service so the URL updates automatically if credentials rotate. If your database service is named something other than `Postgres`, match that name.
+`MKTSCAN_ROLE=scheduler` is the important line. If your database service isn't named exactly `Postgres`, change that word to match — Railway autocompletes as you type `${{`.
 
-The schedule is UTC and covers US market hours on weekdays only. Overnight and weekend runs re-fetch data that has not changed.
+Deploy, then open the logs.
 
----
+## 4. Read the boot diagnostics
 
-## Step 4 — Add your API keys
-
-All optional — Yahoo Finance and the free RSS feeds work with no keys at all. Add whichever you have:
-
-```bash
-MKTSCAN_AV_KEY=...            # alphavantage.co, free tier
-MKTSCAN_FINNHUB_KEY=...       # finnhub.io, free tier
-MKTSCAN_BENZINGA_KEY=...      # Benzinga Pro, ~$50/mo
-MKTSCAN_FINVIZ_COOKIE=...     # FinViz Elite session cookie
-MKTSCAN_WSJ_COOKIE=...        # WSJ+ session cookie
-MKTSCAN_SMTP_PASSWORD=...     # Gmail app password, for alerts
-MKTSCAN_SLACK_WEBHOOK=...
-```
-
-Anything left unset is blanked at load time, which disables that source cleanly rather than sending the string `YOUR_AV_KEY` to a live API and logging a failure every run.
-
-Session cookies expire in 30–90 days. When FinViz or WSJ stops returning articles, that is the first thing to check.
-
----
-
-## Step 5 — Deploy the scheduler and watch the first boot
-
-Trigger a deploy and open the logs. Expect this sequence:
+Every boot prints a `doctor` block. This is the fastest way to tell whether things are working:
 
 ```
-── MktScan scheduler starting ──────────────────────────────
+══════════════════════════════════════════════
+ MktScan — role: scheduler
+══════════════════════════════════════════════
+✓ DATABASE_URL is set
 → Applying database migrations...
-INFO  [alembic.runtime.migration] Running upgrade  -> 0001, Options pipeline fixes
-→ Seeding basket if empty...
+✓ Migrations applied
+
+── MktScan doctor ──────────────────────────
+  role:            scheduler
+  DATABASE_URL:    set (→ postgres.railway.internal:5432/railway)
+  dialect:         postgresql
+  connection:      OK
+  tables:          all 9 present
+  companies        19
+  articles         0
+  ...
+  IV rank:         unavailable — run `mktscan iv --backfill`
+────────────────────────────────────────────
 → Checking implied-volatility history...
-   no IV history — seeding 19 tickers (this takes a few minutes)
-[IV] Backfilling proxy history for 19 tickers (365d)...
-[IV]   AAPL: stored 251 proxy snapshots
-...
-[IV] snapshots updated for 19/19 tickers
-→ Starting scheduler
-MktScan Scheduler — cron: */30 13-21 * * 1-5 (UTC)
-  + daily IV snapshot at 21:15 UTC (weekdays)
-  + weekly backtest Sunday 02:00 UTC
-Running initial scrape on startup...
+  no IV history — seeding 19 tickers (several minutes)
 ```
 
-The IV seed runs once and takes 10–15 minutes — it pulls a year of price history plus a live option chain per ticker. Subsequent boots skip it.
+What to look for:
 
-If you see `WARNING: DATABASE_URL is not set`, the variable reference did not resolve. Go back to Step 3.
-
----
-
-## Step 6 — Add the dashboard service
-
-In the project canvas: **New** → **GitHub Repo** → select the *same* repo again. Rename it **`dashboard`**.
-
-**Settings → Config-as-code → Railway Config File**
-
-```
-/services/dashboard/railway.toml
-```
-
-That file sets:
-
-| Field | Value |
+| Line | Meaning |
 |---|---|
-| Builder | `dockerfile` |
-| Dockerfile Path | `Dockerfile` |
-| Start Command | `./scripts/start-dashboard.sh` |
-| Health Check Path | `/_stcore/health` |
-| Health Check Timeout | `300` |
+| `DATABASE_URL: NOT SET` | The `${{Postgres.DATABASE_URL}}` reference didn't resolve. Check the database service's name. |
+| `dialect: sqlite` | Same problem — it fell back to a local file. |
+| `connection: FAILED` | Database not reachable. Is the Postgres service running? |
+| `tables: missing ...` | Migration didn't run. See troubleshooting. |
+| `role: dashboard` on the scheduler | `MKTSCAN_ROLE` isn't set. |
 
-The healthcheck is `/_stcore/health`, not `/`. Streamlit serves the SPA shell at `/` before the app has finished starting, so Railway would mark the service healthy while it is still booting.
+The IV seed takes 10–15 minutes on first boot only. Let it finish.
 
-**Variables**
+## 5. Add the dashboard
 
-```bash
+Canvas → **New** → **GitHub Repo** → the *same* repo again. Again leave build settings at defaults.
+
+**Variables**:
+
+```
+MKTSCAN_ROLE=dashboard
 DATABASE_URL=${{Postgres.DATABASE_URL}}
 MKTSCAN_SENTIMENT_MODEL=vader
 TZ=UTC
 ```
 
-Then **Settings → Networking → Generate Domain** to get a public URL.
+Then **Settings → Networking → Generate Domain** for the public URL.
 
----
+## 6. API keys (all optional)
 
-## Step 7 — Verify
+Yahoo Finance and the free RSS feeds need no keys. Add whichever you have, to the **scheduler** service:
 
-Open the dashboard URL and check, in order:
-
-1. **Sidebar** — "Companies" shows 19, "Total Articles" is non-zero, "Last Run" is recent. If articles are 0, the scheduler has not completed a scrape yet; wait for the next 30-minute tick.
-2. **Tradeability page** — no orange *"IV rank unavailable for the whole basket"* banner. If it appears, Step 5's IV seed did not finish; see troubleshooting.
-3. **Trade Setups** — expand a card. It should show real bid/ask per leg, a dollar max loss, a breakeven and a probability of profit. Any leg showing `—` for bid/ask means the chain fetch failed.
-
-From your terminal, using the Railway CLI:
-
-```bash
-npm i -g @railway/cli && railway login && railway link
-
-railway run --service scheduler python -m mktscan iv          # IV rank table
-railway run --service scheduler python -m mktscan scores      # sentiment scores
-railway run --service scheduler python -m mktscan setups      # priced setups
+```
+MKTSCAN_AV_KEY=...            # alphavantage.co, free
+MKTSCAN_FINNHUB_KEY=...       # finnhub.io, free
+MKTSCAN_BENZINGA_KEY=...      # ~$50/mo
+MKTSCAN_FINVIZ_COOKIE=...     # Elite session cookie
+MKTSCAN_WSJ_COOKIE=...        # WSJ+ session cookie
+MKTSCAN_SMTP_PASSWORD=...     # Gmail app password, for alerts
+MKTSCAN_SLACK_WEBHOOK=...
 ```
 
-In the IV table, `basis` should read `chain` or `proxy`. If it reads `none`, there is no history.
+Anything unset is blanked at load, which disables that source cleanly rather than sending the literal string `YOUR_AV_KEY` to a live API every run. Session cookies expire in 30–90 days — that's the first thing to check when FinViz or WSJ goes quiet.
 
----
+## 7. Verify
 
-## Step 8 — Seed the backtest (optional)
+On the dashboard: sidebar shows 19 companies and a non-zero article count; the Tradeability page has no orange "IV rank unavailable" banner; a Trade Setup card shows real bid/ask per leg, a dollar max loss and a breakeven.
 
-The weekly backtest runs Sunday 02:00 UTC. To populate it immediately:
+From your terminal:
 
-```bash
+```
+npm i -g @railway/cli && railway login && railway link
+
+railway run --service scheduler python -m mktscan doctor
+railway run --service scheduler python -m mktscan iv
+railway run --service scheduler python -m mktscan setups
+```
+
+## 8. Seed the backtest (optional)
+
+```
 railway run --service scheduler python -c "
 from mktscan.database import get_session, get_basket
 from mktscan.backtest_incremental import run_incremental_backtest
@@ -208,80 +158,70 @@ print(run_incremental_backtest(s, [c.ticker for c in get_basket(s)]))
 "
 ```
 
-First run pulls 5 years per ticker and takes several minutes. Read the **Excess vs buy-and-hold** column, not the raw win rate — a 55% win rate is not an edge if the universe rose on 55% of days anyway.
+First run pulls 5 years per ticker; several minutes. Read the **Excess vs buy-and-hold** column, not the raw win rate — a 55% win rate is not an edge if the universe rose on 55% of days anyway.
 
 ---
 
-## Sentiment model: pick one
+## Sentiment model
 
 | Option | Setting | Cost | Notes |
 |---|---|---|---|
-| **VADER** (default) | `MKTSCAN_SENTIMENT_MODEL=vader` | Free | Weaker on financial jargon. **Recommended to start.** |
-| **OpenAI** | `MKTSCAN_SENTIMENT_MODEL=openai` + `MKTSCAN_OPENAI_KEY=sk-...` | ~$0.001/batch | FinBERT-grade quality, no heavy dependency. Best value. |
-| **FinBERT** | Build with `--build-arg REQUIREMENTS=requirements.txt` | Free, but ~2.5 GB image + ~2 GB RAM | Slow builds, likely to exceed Railway's limits. |
+| **VADER** (default) | `MKTSCAN_SENTIMENT_MODEL=vader` | Free | Weaker on financial jargon. Start here. |
+| **OpenAI** | `=openai` + `MKTSCAN_OPENAI_KEY=sk-...` | ~$0.001/batch | FinBERT-grade, no heavy dependency. Best value. |
+| **FinBERT** | Build with `--build-arg REQUIREMENTS=requirements.txt` | Free, ~2.5 GB image + ~2 GB RAM | Likely to exceed Railway's limits. |
 
-`requirements-railway.txt` omits torch and transformers for exactly this reason. `build_scorer()` falls back to VADER automatically when transformers is missing, so nothing breaks.
-
-Worth keeping in perspective: sentiment carries 12% of the composite weight. Going from VADER to FinBERT moves the final score less than most people expect.
-
----
+`requirements-railway.txt` omits torch and transformers for that reason; `build_scorer()` falls back to VADER automatically. Sentiment is 12% of the composite weight, so the difference is smaller than it sounds.
 
 ## Cost
 
-Railway bills by usage. Rough monthly estimate:
-
-| Service | Est. |
-|---|---|
-| Postgres (small volume) | ~$5 |
-| Scheduler (always on, small) | ~$5–8 |
-| Dashboard (always on, idles cheap) | ~$5 |
-| **Total** | **~$15–20/mo** |
-
-To cut it: narrow `MKTSCAN_SCHEDULE` to `0 14,20 * * 1-5` (twice daily). The tool records one prediction per ticker per day regardless of how often it runs, so a 30-minute cadence buys fresher news and nothing else.
+Roughly **$15–20/mo** across Postgres + two always-on services. To cut it, set `MKTSCAN_SCHEDULE=0 14,20 * * 1-5` — the tool records one prediction per ticker per day regardless of cadence, so more frequent runs buy fresher news and nothing else.
 
 ---
 
 ## Troubleshooting
 
-**`relation "companies" does not exist`** — Migrations have not run. Only the scheduler runs them; check its logs for the alembic line. To apply manually:
-```bash
+**Start by reading the `doctor` block in the logs.** It answers most of these directly.
+
+**Service is running the wrong role** (e.g. Streamlit starting on the scheduler) — `MKTSCAN_ROLE` isn't set on that service. It defaults to `dashboard`. This was the most common failure with the older two-Dockerfile setup.
+
+**`tables: missing ...`** — the migration didn't run. Apply it manually:
+```
 railway run --service scheduler alembic upgrade head
 ```
+The scheduler also falls back to `create_all()` automatically if alembic fails, and logs that it did, so check whether that fallback fired.
 
-**Dashboard shows "No data yet"** — Usually the two services are pointed at different databases. Confirm both have `DATABASE_URL` set and that they resolve to the same value:
-```bash
+**`ValueError: Unknown format code 'f' for object of type 'str'`** — an old build. Pull the latest and redeploy; component values are no longer formatted as floats unconditionally.
+
+**Dashboard shows "No data yet"** — the two services are probably on different databases:
+```
 railway variables --service dashboard | grep DATABASE_URL
 railway variables --service scheduler | grep DATABASE_URL
 ```
 
-**"IV rank unavailable for the whole basket"** — The backfill did not complete. Run it manually:
-```bash
+**"IV rank unavailable for the whole basket"** — the backfill didn't complete:
+```
 railway run --service scheduler python -m mktscan iv --backfill
 railway run --service scheduler python -m mktscan iv --update
 ```
-Until this succeeds, strategy selection runs on its fallback branch: defined-risk debit spreads at half size, regardless of the actual volatility regime. The suggestions are not wrong, but they are uninformed about whether premium is cheap or rich.
+Until it succeeds, strategy selection runs on its fallback branch — defined-risk debit spreads at half size, regardless of the actual volatility regime. Not wrong, but uninformed about whether premium is cheap or rich.
 
-**Build fails, out of disk / times out** — You are building the full `requirements.txt` with torch. Confirm the Dockerfile's `ARG REQUIREMENTS` still defaults to `requirements-railway.txt`.
+**Build fails / out of disk** — you're building the full `requirements.txt` with torch. Confirm the Dockerfile's `ARG REQUIREMENTS` still defaults to `requirements-railway.txt`.
 
-**Yahoo rate limiting (`YFRateLimitError`, empty results)** — Loosen the cadence and add a delay:
-```bash
+**Yahoo rate limiting** (`YFRateLimitError`, empty results) — loosen the cadence and slow down:
+```
 MKTSCAN_SCHEDULE=0 14,20 * * 1-5
 MKTSCAN_DELAY_SECONDS=3.0
 ```
 Also confirm the scheduler is on 1 replica.
 
-**Scheduler restart loop** — Check the logs for the failing step. A common cause is the IV backfill exceeding the container's start-period; the healthcheck allows 300s, but if Yahoo is slow the process can be killed mid-seed. Run the backfill manually via `railway run` and redeploy.
-
-**Health check failing on the scheduler** — `scheduler.py` serves plain text on `$PORT`. Railway only injects `$PORT` for services with a domain; without one it falls back to 8080, which is fine. If Railway insists on a healthcheck, leave the path blank for a worker service.
+**Postgres migration error mentioning `boolean` and `integer`** — an old build. Fixed; pull latest.
 
 ---
 
 ## After deploying
 
-Three things worth doing in the first fortnight:
-
-1. **Check the IV basis after ~60 trading days.** Until then the rank is `proxy` (realised volatility), which the strategy layer deliberately treats as unknown. Real IV ranking only begins once 60 daily chain snapshots have accumulated.
-2. **Watch the accuracy panel, do not act on it yet.** It needs 30 independent observations — one per ticker per trading day — before the numbers mean anything, and score adjustment is off by default.
+1. **Check the IV basis after ~60 trading days.** Until then the rank is `proxy` (realised volatility), which the strategy layer deliberately treats as unknown. Real IV ranking begins once 60 daily chain snapshots exist.
+2. **Watch the accuracy panel; don't act on it yet.** It needs 30 independent observations — one per ticker per trading day — before the numbers mean anything, and score adjustment is off by default.
 3. **Rotate session cookies** when FinViz/WSJ go quiet.
 
-And the standing caveat: this generates research signals from delayed public data. Verify every quote with your broker before trading.
+Standing caveat: this generates research signals from delayed public data. Verify every quote with your broker before trading.

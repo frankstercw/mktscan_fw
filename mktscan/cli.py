@@ -131,6 +131,157 @@ def scores(ctx, days):
 
 
 @cli.command()
+@click.option("--refresh", is_flag=True, help="Fetch and store today's regime snapshot")
+@click.pass_context
+def regime(ctx, refresh):
+    """Show or refresh the separate market-regime context layer."""
+    from .database import init_db, get_session, get_basket
+    from .regime import latest_market_regime, refresh_market_regime
+
+    init_db()
+    session = get_session()
+    try:
+        if refresh:
+            tickers = [c.ticker for c in get_basket(session)]
+            result = refresh_market_regime(session, tickers)
+            console.print(
+                f"[green]✓[/green] {result['label']}  score={result['score']:+.3f}  "
+                f"confidence={result['confidence']:.0%}"
+            )
+        row = latest_market_regime(session)
+        if row is None:
+            console.print("[yellow]No regime snapshot yet. Run `mktscan regime --refresh`.[/yellow]")
+            return
+        table = Table(title=f"Market Regime — {row.snapshot_date}", show_header=False)
+        table.add_column("Metric", style="cyan")
+        table.add_column("Value")
+        table.add_row("Regime", row.regime_label or "—")
+        table.add_row("Score", f"{row.regime_score:+.3f}" if row.regime_score is not None else "—")
+        table.add_row("Confidence", f"{row.confidence:.0%}" if row.confidence is not None else "—")
+        table.add_row("SPY trend", f"{row.spy_trend_score:+.2f}" if row.spy_trend_score is not None else "—")
+        table.add_row("QQQ trend", f"{row.qqq_trend_score:+.2f}" if row.qqq_trend_score is not None else "—")
+        table.add_row("VIX", f"{row.vix:.2f} ({row.volatility_state})" if row.vix is not None else "—")
+        table.add_row("Basket breadth >50d", f"{row.breadth_above_50d:.0f}%" if row.breadth_above_50d is not None else "—")
+        table.add_row("2Y / 10Y", f"{row.two_year_yield:.2f}% / {row.ten_year_yield:.2f}%" if row.two_year_yield is not None and row.ten_year_yield is not None else "—")
+        table.add_row("Next macro", row.next_macro_event or "—")
+        console.print(table)
+    finally:
+        session.close()
+
+
+@cli.command()
+@click.pass_context
+def doctor(ctx):
+    """
+    Print deployment diagnostics: database, schema, data volume, IV history.
+
+    Runs on every container boot so the Railway logs always answer the three
+    questions that matter when something looks broken — is the database
+    reachable, does the schema exist, and is there any data in it. Never raises;
+    a diagnostic that crashes is worse than useless.
+    """
+    import os
+    from sqlalchemy import inspect as sa_inspect, func, select
+
+    console.print("\n[bold cyan]── MktScan doctor ──────────────────────────[/bold cyan]")
+
+    # ── Environment ──────────────────────────────────────────────────────────
+    role = os.environ.get("MKTSCAN_ROLE", "(unset)")
+    db_url = os.environ.get("DATABASE_URL", "")
+    console.print(f"  role:            {role}")
+    if db_url:
+        # Never print credentials.
+        safe = db_url.split("@")[-1] if "@" in db_url else db_url
+        console.print(f"  DATABASE_URL:    [green]set[/green] (→ {safe[:50]})")
+    else:
+        console.print("  DATABASE_URL:    [yellow]NOT SET — using local SQLite[/yellow]")
+    console.print(f"  sentiment model: {os.environ.get('MKTSCAN_SENTIMENT_MODEL', '(from config)')}")
+
+    # ── Database ─────────────────────────────────────────────────────────────
+    try:
+        from .database import get_engine
+        engine = get_engine()
+        console.print(f"  dialect:         {engine.dialect.name}")
+        with engine.connect() as conn:
+            conn.exec_driver_sql("SELECT 1")
+        console.print("  connection:      [green]OK[/green]")
+    except Exception as e:
+        console.print(f"  connection:      [red]FAILED — {e}[/red]")
+        console.print("[bold cyan]────────────────────────────────────────────[/bold cyan]\n")
+        return
+
+    # ── Schema ───────────────────────────────────────────────────────────────
+    expected = [
+        "companies", "articles", "sentiment_scores", "price_snapshots",
+        "earnings_events", "scraper_runs", "tradeability_outcomes",
+        "iv_snapshots", "backtest_observations",
+        "macro_events", "market_regime_snapshots",
+    ]
+    try:
+        present = set(sa_inspect(engine).get_table_names())
+        missing = [t for t in expected if t not in present]
+        if missing:
+            console.print(f"  tables:          [red]missing {', '.join(missing)}[/red]")
+            console.print("                   → run `alembic upgrade head`")
+        else:
+            console.print(f"  tables:          [green]all {len(expected)} present[/green]")
+    except Exception as e:
+        console.print(f"  tables:          [red]inspect failed — {e}[/red]")
+        return
+
+    # ── Row counts ───────────────────────────────────────────────────────────
+    from .database import (
+        get_session, Company, Article, PriceSnapshot, SentimentScore,
+        IVSnapshot, EarningsEvent,
+    )
+    session = get_session()
+    try:
+        for label, model in (
+            ("companies", Company), ("articles", Article),
+            ("prices", PriceSnapshot), ("scores", SentimentScore),
+            ("earnings", EarningsEvent), ("iv snapshots", IVSnapshot),
+        ):
+            try:
+                pk = list(model.__table__.primary_key.columns)[0]
+                n = session.execute(select(func.count(pk))).scalar() or 0
+                colour = "green" if n else "yellow"
+                console.print(f"  {label:15s}  [{colour}]{n:,}[/{colour}]")
+            except Exception as e:
+                session.rollback()
+                console.print(f"  {label:15s}  [red]error — {e}[/red]")
+
+        # ── IV rank readiness ────────────────────────────────────────────────
+        try:
+            from .iv_rank import compute_iv_rank
+            from .database import get_basket
+
+            tickers = [c.ticker for c in get_basket(session)]
+            if tickers:
+                bases = {}
+                for tk in tickers[:5]:
+                    bases[tk] = compute_iv_rank(session, tk)["basis"]
+                if all(b == "none" for b in bases.values()):
+                    console.print(
+                        "  IV rank:         [yellow]unavailable — "
+                        "run `mktscan iv --backfill`[/yellow]"
+                    )
+                    console.print(
+                        "                   strategy selection will use its "
+                        "fallback branch until seeded"
+                    )
+                else:
+                    summary = ", ".join(f"{k}={v}" for k, v in bases.items())
+                    console.print(f"  IV rank:         [green]{summary}[/green]")
+        except Exception as e:
+            session.rollback()
+            console.print(f"  IV rank:         [red]check failed — {e}[/red]")
+    finally:
+        session.close()
+
+    console.print("[bold cyan]────────────────────────────────────────────[/bold cyan]\n")
+
+
+@cli.command()
 @click.option("--backfill", is_flag=True, help="Seed IV history from realised vol (run once)")
 @click.option("--update",   is_flag=True, help="Record today's ATM IV from the option chain")
 @click.option("--check",    is_flag=True, help="Inspect and repair the database schema")

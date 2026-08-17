@@ -13,6 +13,13 @@ scraper:
   user_agent: "MktScan/1.0 (personal research tool)"
   timeout_seconds: 15
 
+market_regime:
+  enabled: true
+  # Context only: this layer is recorded alongside predictions but does NOT
+  # modify tradeability, strategy selection, or position sizing yet.
+  history_period: "1y"
+  breadth_universe: "basket"
+
 sources:
   yahoo_finance:
     enabled: true              # Essential — prices, news, earnings. Never disable.

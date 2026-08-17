@@ -490,3 +490,32 @@ mispriced.
   Scraping at scale may violate ToS — use responsibly and at low frequency.
 
 Always add polite delays (`delay_seconds: 2.5+`) and respect `robots.txt`.
+
+## Market regime context (v2)
+
+MktScan now records a separate daily market-regime layer. It is **context only**:
+it does not modify tradeability, strategy selection, or position sizing until the
+forward dataset is large enough to validate that regime conditioning adds value.
+
+Inputs:
+
+- SPY + QQQ trend: EMA alignment plus 20d/60d momentum
+- Volatility: VIX level, 5d change, 20d percentile and 1y percentile
+- Breadth: participation of the active MktScan basket above 20d/50d/200d moving averages and with positive 5d/20d returns
+- Rates: FRED DGS2 and DGS10, 10Y-2Y curve, 5d/20d change in the 10Y
+- Macro risk: proximity to the next persisted high-impact MarketWatch event
+
+Directional regime score weights are 45% trend, 25% breadth, 20% volatility and
+10% rates. Macro risk is deliberately non-directional: it adds a `CAUTION` suffix
+near major releases but does not change the score itself.
+
+```bash
+alembic upgrade head
+python -m mktscan regime --refresh
+python -m mktscan regime
+```
+
+The scraper refreshes regime automatically in `all` and `prices` modes. A single
+`market_regime_snapshots` row is updated per US market date; daily prediction
+records also capture the contemporaneous regime label/score/confidence for later
+regime-conditioned validation.

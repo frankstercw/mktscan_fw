@@ -110,6 +110,25 @@ def _clamp(value: float, lo: float = -1.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, value))
 
 
+def fmt_component(value: Any) -> str:
+    """
+    Format a component value for a human-readable detail string.
+
+    Component dicts hold mixed types on purpose: signed float sub-scores, plus
+    context like `iv_basis` (str), `mean_reversion_flag` (bool) and
+    `earnings_days_away` (int), any of which may be None when data is missing.
+    Applying a float format code to all of them raises ValueError, so every
+    detail string must go through this.
+    """
+    if value is None:
+        return "n/a"
+    if isinstance(value, bool):          # before int — bool subclasses int
+        return "yes" if value else "no"
+    if isinstance(value, float):
+        return f"{value:+.2f}"
+    return str(value)
+
+
 def _empty(detail: str) -> dict[str, Any]:
     return {"score": 0.0, "confidence": 0.0, "detail": detail, "components": {}}
 
@@ -374,7 +393,7 @@ def calc_technical_signal(
     return {
         "score": round(score, 4),
         "confidence": round(min(1.0, len(signals) / 4.0), 3),
-        "detail": " | ".join(f"{k}: {v:+.2f}" for k, v in components.items()),
+        "detail": " | ".join(f"{k}: {fmt_component(v)}" for k, v in components.items()),
         "components": components,
     }
 
@@ -594,7 +613,7 @@ def calc_fundamental_signal(
     return {
         "score": round(score, 4),
         "confidence": round(min(1.0, len(signals) / 3.0), 3),
-        "detail": " | ".join(f"{k}: {v}" for k, v in components.items()),
+        "detail": " | ".join(f"{k}: {fmt_component(v)}" for k, v in components.items()),
         "components": components,
     }
 
@@ -673,7 +692,7 @@ def calc_event_driven_signal(
     return {
         "score": round(score, 4),
         "confidence": round(min(1.0, len(signals) / 3.0), 3),
-        "detail": " | ".join(f"{k}: {v}" for k, v in components.items()),
+        "detail": " | ".join(f"{k}: {fmt_component(v)}" for k, v in components.items()),
         "components": components,
         "days_to_earnings": days_away,
     }
@@ -759,7 +778,7 @@ def calc_short_interest_signal(
     return {
         "score": round(score, 4),
         "confidence": round(min(1.0, len(signals) / 2.0), 3),
-        "detail": " | ".join(f"{k}: {v}" for k, v in components.items()),
+        "detail": " | ".join(f"{k}: {fmt_component(v)}" for k, v in components.items()),
         "components": components,
     }
 
@@ -897,7 +916,7 @@ def calc_analyst_signal(
     return {
         "score": round(score, 4),
         "confidence": round(min(1.0, len(signals) / 2.0), 3),
-        "detail": " | ".join(f"{k}: {v}" for k, v in components.items()),
+        "detail": " | ".join(f"{k}: {fmt_component(v)}" for k, v in components.items()),
         "components": components,
     }
 

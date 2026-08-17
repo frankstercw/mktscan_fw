@@ -55,6 +55,21 @@ def upgrade() -> None:
     inspector = sa.inspect(bind)
     tables = set(inspector.get_table_names())
 
+    # ── Fresh database: create the whole schema and stop ─────────────────────
+    # Everything below this point is a *patch* to an existing database, guarded
+    # by `if "<table>" in tables`. On an empty database every one of those guards
+    # is False, so without this branch the migration would create almost nothing,
+    # stamp itself as applied, and leave the app relying on create_all() to
+    # quietly build the schema afterwards — which works by accident and hides
+    # real failures. A new deployment gets the full schema here, from the models.
+    core_tables = {"companies", "articles", "sentiment_scores", "price_snapshots"}
+    if not (core_tables & tables):
+        from mktscan.database import Base
+        import mktscan.backtest_incremental  # noqa: F401  registers backtest tables
+
+        Base.metadata.create_all(bind)
+        return
+
     # ── iv_snapshots ─────────────────────────────────────────────────────────
     if "iv_snapshots" not in tables:
         op.create_table(
@@ -108,7 +123,15 @@ def upgrade() -> None:
         if "ix_earnings_ticker_date" not in existing_indexes:
             op.create_index("ix_earnings_ticker_date", "earnings_events",
                             ["ticker", "report_date"])
-        op.execute("UPDATE earnings_events SET is_upcoming = 1 WHERE period = 'Upcoming'")
+        # Postgres has a real BOOLEAN type and rejects `= 1` with
+        # "column is of type boolean but expression is of type integer",
+        # which aborts the whole migration transaction. SQLite stores booleans
+        # as integers and accepts either. Use the dialect's own literal.
+        true_literal = "true" if bind.dialect.name != "sqlite" else "1"
+        op.execute(
+            f"UPDATE earnings_events SET is_upcoming = {true_literal} "
+            f"WHERE period = 'Upcoming'"
+        )
         # surprise_pct held yfinance's epsDifference — an absolute dollar amount
         # consumed downstream as a percentage. The stored values are not
         # convertible without the estimate, so recompute where we can and clear

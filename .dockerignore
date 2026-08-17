@@ -27,6 +27,7 @@ htmlcov/
 .git/
 .github/
 .gitignore
+# Docs are excluded from the image but tracked in git.
 *.md
 !README.md
 

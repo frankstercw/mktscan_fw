@@ -1,25 +1,18 @@
-# Point the service at this file via
-#   Settings → Config-as-code → Railway Config File = /services/dashboard/railway.toml
-# The absolute path is required: Railway only auto-detects railway.toml at the
-# repo root, and the config path does not follow the Root Directory setting.
-# Values here override the dashboard UI.
+# Optional — see services/scheduler/railway.toml. Both services now build the
+# same root Dockerfile; MKTSCAN_ROLE decides which one a container becomes.
 
 [build]
 builder = "dockerfile"
 dockerfilePath = "Dockerfile"
 watchPatterns = [
-  "dashboard/**",
-  "mktscan/**",
-  "scripts/start-dashboard.sh",
-  "requirements*.txt",
-  "Dockerfile",
-  "config.yaml",
+  "dashboard/**", "mktscan/**", "scripts/**",
+  "requirements*.txt", "Dockerfile", "config.yaml",
 ]
 
 [deploy]
-startCommand = "./scripts/start-dashboard.sh"
-# Streamlit's own health endpoint, not "/" — "/" returns the SPA shell before the
-# app is actually ready, so Railway would mark the service healthy too early.
+startCommand = "./scripts/start.sh"
+# Streamlit's own health endpoint, not "/" — "/" returns the SPA shell before
+# the app is ready, so Railway would mark the service healthy too early.
 healthcheckPath = "/_stcore/health"
 healthcheckTimeout = 300
 restartPolicyType = "on_failure"
