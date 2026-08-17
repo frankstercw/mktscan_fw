@@ -71,6 +71,10 @@ ROUND_TRIP_COST_PCT = 0.04
 
 MIN_HISTORY_BARS = 260      # ~1 trading year, so the 252-day 52w range is valid
 
+# Keep PostgreSQL bulk INSERT statements reasonably sized. Smaller batches reduce
+# memory/statement size and limit how much work is lost if a batch fails.
+BACKTEST_BATCH_SIZE = 500
+
 
 # ── Models ────────────────────────────────────────────────────────────────────
 
@@ -487,14 +491,14 @@ def run_incremental_backtest(
                 fwd_5d=_r(fwd.get(5)), fwd_10d=_r(fwd.get(10)),
                 fwd_21d=_r(fwd.get(21)), fwd_63d=_r(fwd.get(63)),
                 strategy=option["strategy"] if option else None,
-                option_pnl_pct=option["pnl_pct"] if option else None,
+                option_pnl_pct=float(option["pnl_pct"]) if option else None,
                 option_win=option["win"] if option else None,
                 realized_vol=round(rv, 4) if rv else None,
             ))
             existing_keys.add((ticker, obs_date))
             new_rows += 1
 
-            if len(pending) >= 2000:
+            if len(pending) >= BACKTEST_BATCH_SIZE:
                 session.add_all(pending)
                 session.commit()
                 pending = []
@@ -515,7 +519,8 @@ def run_incremental_backtest(
 
 
 def _r(value: float | None) -> float | None:
-    return round(value, 4) if value is not None else None
+    """Round numeric values after converting NumPy scalars to native Python floats."""
+    return round(float(value), 4) if value is not None else None
 
 
 # ── Summary ───────────────────────────────────────────────────────────────────
