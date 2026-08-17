@@ -2595,6 +2595,38 @@ elif page == "Options Market":
             c.metric("Term Structure", r.term_state or "—")
             d.metric("Expected Move", f"±{r.expected_move_pct:.1f}%" if r.expected_move_pct is not None else "—")
 
+            # Interpretation is intentionally display-only. Pull the latest recorded
+            # tradeability prediction when available, but do not modify either model.
+            from mktscan.options_interpretation import interpret_options_market
+            from mktscan.database import TradeabilityOutcome
+            from sqlalchemy import select as _om_select
+            _is = get_session()
+            _pred = _is.execute(
+                _om_select(TradeabilityOutcome)
+                .where(TradeabilityOutcome.ticker == r.ticker)
+                .order_by(TradeabilityOutcome.predicted_at.desc())
+                .limit(1)
+            ).scalar_one_or_none()
+            _is.close()
+            _score = _pred.score_at_prediction if _pred else None
+            _label = _pred.label_at_prediction if _pred else None
+            interp = interpret_options_market(r, _score, _label)
+
+            st.subheader("Options Interpretation")
+            st.caption("Display-only research interpretation. It does not alter tradeability, strategy selection, or position sizing.")
+            x1, x2, x3 = st.columns(3)
+            x1.metric("Relative IV", interp.iv_state)
+            x2.metric("Underlying Bias", _label or "Unknown")
+            x3.metric("Structure Bias", interp.structure_bias)
+
+            st.markdown(f"**Thesis:** {interp.thesis}")
+            with st.expander("Why this interpretation?", expanded=True):
+                st.markdown(f"**Term structure:** {interp.term_view}")
+                st.markdown(f"**Skew:** {interp.skew_view}")
+                st.markdown(f"**Expected move:** {interp.move_view}")
+            if interp.cautions:
+                st.warning("\n".join(f"• {item}" for item in interp.cautions))
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # BACKTEST PAGE
