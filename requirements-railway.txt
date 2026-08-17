@@ -35,7 +35,7 @@ psycopg2-binary>=2.9.9
 alembic>=1.13.0
 
 # Dashboard
-streamlit>=1.29.0
+streamlit>=1.37.0
 plotly>=5.18.0
 
 # Config & utilities

@@ -526,3 +526,22 @@ MktScan supports an optional ORATS research layer for historical option chains,
 actual-chain option backtesting, and daily options-market analytics. Set
 `ORATS_API_TOKEN`, run `alembic upgrade head`, and see [`OPTIONS_DATA.md`](OPTIONS_DATA.md).
 Paid-provider calls are opt-in; automatic refresh is disabled by default.
+
+## Live stock charts (Alpaca)
+
+The **Live Charts** dashboard page uses Alpaca Market Data directly over REST. It
+normalizes provider data under `mktscan/providers/` and does not persist intraday
+bars to Postgres.
+
+Required dashboard-service environment variables:
+
+```bash
+ALPACA_API_KEY=...
+ALPACA_SECRET_KEY=...
+ALPACA_DATA_FEED=iex   # use sip only with SIP entitlement
+```
+
+The page supports 1D, 5D, 1M, 3M, 6M and 1Y ranges. Intraday views show EMA 9,
+EMA 20, session-reset VWAP, volume, a 20-bar volume average and relative volume.
+The live fragment can refresh every 15, 30 or 60 seconds. Quotes and bars are
+cached for 15 seconds to avoid repeated requests on normal Streamlit reruns.

@@ -143,6 +143,37 @@ def cached_market_regime():
         session.close()
 
 
+@st.cache_data(ttl=15, show_spinner=False)
+def cached_live_quote(ticker: str, feed: str, refresh_nonce: int = 0):
+    """Alpaca stock snapshot. The nonce lets the Refresh button bypass TTL."""
+    from mktscan.providers.alpaca import AlpacaMarketDataClient
+    return AlpacaMarketDataClient(feed=feed).get_quote(ticker)
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def cached_live_bars(ticker: str, range_label: str, feed: str, refresh_nonce: int = 0) -> pd.DataFrame:
+    """Chart bars from Alpaca with a short cache for Streamlit reruns."""
+    from mktscan.live_charts import chart_window, prepare_chart_bars
+    from mktscan.providers.alpaca import AlpacaMarketDataClient
+    cfg, start, end = chart_window(range_label)
+    raw = AlpacaMarketDataClient(feed=feed).get_bars(
+        ticker, timeframe=cfg.timeframe, start=start, end=end, limit=cfg.max_bars
+    )
+    return prepare_chart_bars(raw, range_label)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_daily_bars(ticker: str, feed: str, refresh_nonce: int = 0) -> pd.DataFrame:
+    """Daily bars used only for the current-session RVOL baseline."""
+    from datetime import timezone
+    from mktscan.providers.alpaca import AlpacaMarketDataClient
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=45)
+    return AlpacaMarketDataClient(feed=feed).get_bars(
+        ticker, timeframe="1Day", start=start, end=end, limit=60
+    )
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def cached_sidebar_stats() -> dict:
     """Sidebar counters. These ran a COUNT(*) over articles on every rerun of
@@ -170,7 +201,7 @@ with st.sidebar:
 
     page = st.radio(
         "Navigation",
-        ["Dashboard", "Tradeability", "Options Market", "News Feed", "Earnings", "Economic Calendar", "Basket", "Backtest", "Data Definitions", "Run Scraper"],
+        ["Dashboard", "Tradeability", "Live Charts", "Options Market", "News Feed", "Earnings", "Economic Calendar", "Basket", "Backtest", "Data Definitions", "Run Scraper"],
         label_visibility="collapsed",
     )
 
@@ -2506,6 +2537,179 @@ elif page == "Basket":
                     st.rerun()
 
     session.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LIVE STOCK CHARTS PAGE
+# ═══════════════════════════════════════════════════════════════════════════════
+elif page == "Live Charts":
+    st.title("Live Stock Charts")
+    st.caption(
+        "Alpaca Market Data · live/near-live quote + intraday bars with EMA 9, EMA 20, "
+        "session VWAP and volume. Data are cached briefly and are not persisted to Postgres."
+    )
+
+    from mktscan.live_charts import CHART_RANGES, daily_relative_volume
+    from mktscan.providers.alpaca import AlpacaMarketDataError
+    from plotly.subplots import make_subplots
+
+    _lc_session = get_session()
+    try:
+        _lc_tickers = [c.ticker for c in get_basket(_lc_session)]
+    finally:
+        _lc_session.close()
+
+    if not _lc_tickers:
+        st.info("Your basket is empty. Add tickers on the Basket page first.")
+    else:
+        default_feed = os.getenv("ALPACA_DATA_FEED", "iex").lower()
+        if default_feed not in {"iex", "sip"}:
+            default_feed = "iex"
+
+        c1, c2, c3, c4 = st.columns([2.2, 3.2, 1.6, 1.6])
+        with c1:
+            live_ticker = st.selectbox("Ticker", _lc_tickers, key="live_chart_ticker")
+        with c2:
+            live_range = st.radio(
+                "Range", list(CHART_RANGES.keys()), horizontal=True, key="live_chart_range"
+            )
+        with c3:
+            feed_choices = ["iex", "sip"]
+            live_feed = st.selectbox(
+                "Feed", feed_choices, index=feed_choices.index(default_feed),
+                format_func=lambda x: {"iex": "IEX", "sip": "SIP"}[x],
+                help="IEX is commonly available on Alpaca's basic market-data access. SIP requires the corresponding entitlement."
+            )
+        with c4:
+            live_interval = st.selectbox("Refresh", [15, 30, 60], format_func=lambda x: f"{x}s")
+
+        o1, o2, o3, o4 = st.columns([1.4, 1.2, 1.2, 4.0])
+        with o1:
+            live_auto = st.toggle("Auto refresh", value=True, key="live_chart_auto")
+        with o2:
+            show_ema9 = st.checkbox("EMA 9", value=True, key="live_ema9")
+        with o3:
+            show_ema20 = st.checkbox("EMA 20", value=True, key="live_ema20")
+        with o4:
+            show_vwap = st.checkbox("VWAP (intraday)", value=True, key="live_vwap")
+
+        if "live_refresh_nonce" not in st.session_state:
+            st.session_state.live_refresh_nonce = 0
+
+        run_every = f"{live_interval}s" if live_auto else None
+
+        @st.fragment(run_every=run_every)
+        def render_live_chart():
+            top_left, top_right = st.columns([5, 1])
+            with top_right:
+                if st.button("↻ Refresh now", use_container_width=True, key="live_refresh_now"):
+                    st.session_state.live_refresh_nonce += 1
+
+            nonce = int(st.session_state.live_refresh_nonce)
+            try:
+                quote = cached_live_quote(live_ticker, live_feed, nonce)
+                bars = cached_live_bars(live_ticker, live_range, live_feed, nonce)
+                daily = cached_daily_bars(live_ticker, live_feed, nonce)
+            except AlpacaMarketDataError as exc:
+                st.error(str(exc))
+                st.info(
+                    "Add `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` to the Railway dashboard service. "
+                    "Use `ALPACA_DATA_FEED=iex` unless your Alpaca plan includes SIP access."
+                )
+                return
+            except Exception as exc:
+                st.error(f"Live market-data request failed: {exc}")
+                return
+
+            if bars is None or bars.empty:
+                st.warning(f"No {live_range} bars returned for {live_ticker} from the {live_feed.upper()} feed.")
+                return
+
+            daily_rvol = daily_relative_volume(daily, quote.day_volume)
+            last = quote.last
+            change = quote.change
+            change_pct = quote.change_pct
+
+            with top_left:
+                if last is not None:
+                    delta = None
+                    if change is not None and change_pct is not None:
+                        delta = f"{change:+.2f} ({change_pct:+.2f}%)"
+                    st.metric(f"{live_ticker} · {live_feed.upper()}", f"${last:,.2f}", delta=delta)
+                else:
+                    st.metric(f"{live_ticker} · {live_feed.upper()}", "—")
+
+            q1, q2, q3, q4, q5, q6 = st.columns(6)
+            q1.metric("Bid", f"${quote.bid:,.2f}" if quote.bid is not None else "—")
+            q2.metric("Ask", f"${quote.ask:,.2f}" if quote.ask is not None else "—")
+            q3.metric("Spread", f"${quote.spread:,.3f}" if quote.spread is not None else "—")
+            q4.metric("Day High", f"${quote.day_high:,.2f}" if quote.day_high is not None else "—")
+            q5.metric("Day Low", f"${quote.day_low:,.2f}" if quote.day_low is not None else "—")
+            q6.metric("Daily RVOL", f"{daily_rvol:.2f}×" if daily_rvol is not None else "—")
+
+            # Plot in New York time to make market sessions intuitive.
+            x = bars["market_time"] if "market_time" in bars.columns else bars["timestamp"]
+            price_fig = go.Figure()
+            price_fig.add_trace(go.Candlestick(
+                x=x, open=bars["open"], high=bars["high"], low=bars["low"], close=bars["close"],
+                name=live_ticker,
+            ))
+            if show_ema9 and "ema_9" in bars:
+                price_fig.add_trace(go.Scatter(x=x, y=bars["ema_9"], mode="lines", name="EMA 9"))
+            if show_ema20 and "ema_20" in bars:
+                price_fig.add_trace(go.Scatter(x=x, y=bars["ema_20"], mode="lines", name="EMA 20"))
+            if show_vwap and "vwap" in bars and bars["vwap"].notna().any():
+                price_fig.add_trace(go.Scatter(x=x, y=bars["vwap"], mode="lines", name="VWAP"))
+            price_fig.update_layout(
+                height=560,
+                margin=dict(l=10, r=10, t=36, b=10),
+                title=f"{live_ticker} · {live_range} · {CHART_RANGES[live_range].timeframe}",
+                xaxis_rangeslider_visible=False,
+                hovermode="x unified",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+            )
+            price_fig.update_xaxes(title=None)
+            price_fig.update_yaxes(title="Price ($)")
+            st.plotly_chart(price_fig, use_container_width=True, key=f"live-price-{live_ticker}-{live_range}")
+
+            volume_fig = go.Figure()
+            volume_fig.add_trace(go.Bar(x=x, y=bars["volume"], name="Volume"))
+            if "volume_sma_20" in bars:
+                volume_fig.add_trace(go.Scatter(x=x, y=bars["volume_sma_20"], mode="lines", name="20-bar avg"))
+            volume_fig.update_layout(
+                height=220,
+                margin=dict(l=10, r=10, t=25, b=10),
+                hovermode="x unified",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+            )
+            volume_fig.update_yaxes(title="Volume")
+            st.plotly_chart(volume_fig, use_container_width=True, key=f"live-volume-{live_ticker}-{live_range}")
+
+            latest = bars.iloc[-1]
+            i1, i2, i3, i4 = st.columns(4)
+            i1.metric("EMA 9", f"${latest['ema_9']:,.2f}" if pd.notna(latest.get("ema_9")) else "—")
+            i2.metric("EMA 20", f"${latest['ema_20']:,.2f}" if pd.notna(latest.get("ema_20")) else "—")
+            i3.metric("VWAP", f"${latest['vwap']:,.2f}" if pd.notna(latest.get("vwap")) else "—")
+            i4.metric("Bar RVOL", f"{latest['bar_rvol']:.2f}×" if pd.notna(latest.get("bar_rvol")) else "—")
+
+            if quote.timestamp:
+                ts = pd.Timestamp(quote.timestamp)
+                if ts.tzinfo is None:
+                    ts = ts.tz_localize("UTC")
+                ts = ts.tz_convert("America/New_York")
+                st.caption(
+                    f"Latest quote/trade timestamp: {ts.strftime('%Y-%m-%d %H:%M:%S %Z')} · "
+                    f"Source: Alpaca/{live_feed.upper()} · cache TTL 15s"
+                )
+            else:
+                st.caption(f"Source: Alpaca/{live_feed.upper()} · cache TTL 15s")
+
+        if not os.getenv("ALPACA_API_KEY") and not os.getenv("APCA_API_KEY_ID"):
+            st.warning(
+                "Alpaca credentials are not configured on this service yet. Add `ALPACA_API_KEY` and "
+                "`ALPACA_SECRET_KEY` in Railway, then redeploy the dashboard."
+            )
+        render_live_chart()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

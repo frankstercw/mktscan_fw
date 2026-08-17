@@ -20,7 +20,7 @@ setup(
         "apscheduler>=3.10.0",
         "sqlalchemy>=2.0.0",
         "alembic>=1.13.0",
-        "streamlit>=1.29.0",
+        "streamlit>=1.37.0",
         "plotly>=5.18.0",
         "pyyaml>=6.0.1",
         "python-dotenv>=1.0.0",
