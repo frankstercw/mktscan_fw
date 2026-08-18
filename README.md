@@ -545,3 +545,9 @@ The page supports 1D, 5D, 1M, 3M, 6M and 1Y ranges. Intraday views show EMA 9,
 EMA 20, session-reset VWAP, volume, a 20-bar volume average and relative volume.
 The live fragment can refresh every 15, 30 or 60 seconds. Quotes and bars are
 cached for 15 seconds to avoid repeated requests on normal Streamlit reruns.
+
+## Trade Journal v1
+
+The dashboard includes a manual Trade Journal for recording real stock and option trades. At entry, MktScan freezes the latest tradeability, market-regime, and options-market context available at or before the trade timestamp. Open positions support manual marking; closed positions calculate realized P&L, return on risk, and holding period. Performance views include cumulative P&L and attribution by strategy, market regime, IV percentile, tradeability bucket, and exit reason.
+
+Deploy schema changes with `alembic upgrade head` (migration `0004_trade_journal.py`).

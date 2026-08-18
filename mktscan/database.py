@@ -414,6 +414,79 @@ class OptionsMarketSnapshot(Base):
         Index("ix_options_market_ticker_date", "ticker", "snapshot_date"),
     )
 
+
+class TradeJournalEntry(Base):
+    """Manual trade journal with immutable MktScan context captured at entry."""
+    __tablename__ = "trade_journal_entries"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ticker = Column(String(10), nullable=False)
+    instrument_type = Column(String(10), nullable=False, default="OPTION")  # OPTION | STOCK
+    direction = Column(String(10), nullable=False)  # BULLISH | BEARISH
+    strategy = Column(String(60), nullable=False)
+    status = Column(String(10), nullable=False, default="OPEN")
+    opened_at = Column(DateTime, nullable=False)
+    closed_at = Column(DateTime)
+
+    thesis = Column(Text)
+    tags = Column(Text)
+    notes = Column(Text)
+
+    underlying_entry = Column(Float)
+    underlying_exit = Column(Float)
+    expiration = Column(Date)
+    long_option_type = Column(String(4))
+    long_strike = Column(Float)
+    short_option_type = Column(String(4))
+    short_strike = Column(Float)
+
+    quantity = Column(Float, nullable=False, default=1)
+    multiplier = Column(Integer, nullable=False, default=100)
+    entry_type = Column(String(10), nullable=False, default="DEBIT")  # DEBIT | CREDIT
+    entry_value = Column(Float, nullable=False)
+    current_value = Column(Float)
+    exit_value = Column(Float)
+    entry_fees = Column(Float, default=0)
+    exit_fees = Column(Float, default=0)
+    marked_at = Column(DateTime)
+
+    planned_max_loss = Column(Float)
+    stop_condition = Column(Text)
+    profit_target = Column(Text)
+    planned_exit_date = Column(Date)
+    exit_reason = Column(String(50))
+
+    realized_pnl = Column(Float)
+    return_on_risk_pct = Column(Float)
+    holding_days = Column(Float)
+
+    # Immutable snapshots captured when the trade is logged.
+    tradeability_prediction_id = Column(Integer)
+    tradeability_score = Column(Float)
+    tradeability_label = Column(String(20))
+    regime_snapshot_id = Column(Integer)
+    regime_score = Column(Float)
+    regime_label = Column(String(40))
+    options_snapshot_id = Column(Integer)
+    options_source = Column(String(30))
+    atm_iv = Column(Float)
+    iv_rank = Column(Float)
+    iv_percentile = Column(Float)
+    iv_30d = Column(Float)
+    iv_60d = Column(Float)
+    iv_90d = Column(Float)
+    put_skew = Column(Float)
+    call_skew = Column(Float)
+    expected_move_pct = Column(Float)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        Index("ix_trade_journal_status_opened", "status", "opened_at"),
+        Index("ix_trade_journal_ticker_opened", "ticker", "opened_at"),
+    )
+
 # ── Engine & session factory ──────────────────────────────────────────────────
 
 _engine = None

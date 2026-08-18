@@ -157,3 +157,18 @@ that actually existed when the prediction was made.
 Commands: `python -m mktscan regime --refresh` and `python -m mktscan regime`.
 The dashboard now shows a Market Regime panel. Do not wire this score into
 tradeability or sizing until regime-conditioned forward results demonstrate edge.
+
+---
+
+## Trade Journal v1 (added 2026-08-17)
+
+A manual Trade Journal is now available in the Streamlit sidebar. It stores real trades separately from backtest/model outcomes and freezes MktScan context at trade entry so future analytics do not use revised/current market state.
+
+New pieces:
+- `mktscan/trade_journal.py` — context capture, P&L/ROR, marking and closing helpers.
+- `TradeJournalEntry` model in `mktscan/database.py`.
+- `migrations/versions/0004_trade_journal.py`.
+- Dashboard tabs: Open Positions, Log Trade, Manage Trade, Trade History, Performance.
+- Attribution by strategy, market regime, IV percentile, tradeability magnitude, and exit reason.
+
+Current marks are manual. Automatic live option marking is intentionally deferred until a live options provider is connected.

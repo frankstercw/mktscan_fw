@@ -201,7 +201,7 @@ with st.sidebar:
 
     page = st.radio(
         "Navigation",
-        ["Dashboard", "Tradeability", "Live Charts", "Options Market", "News Feed", "Earnings", "Economic Calendar", "Basket", "Backtest", "Data Definitions", "Run Scraper"],
+        ["Dashboard", "Tradeability", "Live Charts", "Options Market", "Trade Journal", "News Feed", "Earnings", "Economic Calendar", "Basket", "Backtest", "Data Definitions", "Run Scraper"],
         label_visibility="collapsed",
     )
 
@@ -2830,6 +2830,258 @@ elif page == "Options Market":
                 st.markdown(f"**Expected move:** {interp.move_view}")
             if interp.cautions:
                 st.warning("\n".join(f"• {item}" for item in interp.cautions))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TRADE JOURNAL PAGE
+# ═══════════════════════════════════════════════════════════════════════════════
+elif page == "Trade Journal":
+    st.title("Trade Journal v1")
+    st.caption(
+        "Log real trades, freeze MktScan context at entry, and measure your realized execution performance. "
+        "Journal results are kept separate from model/backtest outcomes."
+    )
+
+    from mktscan.database import TradeJournalEntry
+    from mktscan.trade_journal import (
+        close_trade, create_trade, iv_bucket, mark_trade, score_bucket, trade_metrics,
+    )
+    from sqlalchemy import select as _tj_select
+
+    _tj_session = get_session()
+    _trades = list(_tj_session.execute(
+        _tj_select(TradeJournalEntry).order_by(TradeJournalEntry.opened_at.desc())
+    ).scalars())
+    _tj_session.close()
+    _open = [t for t in _trades if t.status == "OPEN"]
+    _closed = [t for t in _trades if t.status == "CLOSED"]
+
+    tab_open, tab_log, tab_manage, tab_history, tab_perf = st.tabs(
+        ["Open Positions", "Log Trade", "Manage Trade", "Trade History", "Performance"]
+    )
+
+    with tab_open:
+        if not _open:
+            st.info("No open journal positions yet.")
+        else:
+            rows = []
+            for t in _open:
+                m = trade_metrics(t, use_current=True)
+                rows.append({
+                    "ID": t.id, "Ticker": t.ticker, "Strategy": t.strategy,
+                    "Opened": t.opened_at, "Qty": t.quantity,
+                    "Entry": t.entry_value, "Current Mark": t.current_value,
+                    "P&L": m.pnl, "ROR %": m.return_on_risk_pct,
+                    "DTE": (t.expiration - date.today()).days if t.expiration else None,
+                    "Tradeability": t.tradeability_score, "Regime": t.regime_label,
+                    "IV Pct": t.iv_percentile,
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True,
+                         column_config={
+                             "Entry": st.column_config.NumberColumn(format="$%.2f"),
+                             "Current Mark": st.column_config.NumberColumn(format="$%.2f"),
+                             "P&L": st.column_config.NumberColumn(format="$%.2f"),
+                             "ROR %": st.column_config.NumberColumn(format="%.1f%%"),
+                             "Tradeability": st.column_config.NumberColumn(format="%.3f"),
+                             "IV Pct": st.column_config.NumberColumn(format="%.0f"),
+                         })
+            st.caption("Current P&L uses your most recent manual mark. Live option marking can be added later when the real-time options provider is connected.")
+
+    with tab_log:
+        _log_session = get_session()
+        _basket = get_basket(_log_session)
+        _log_session.close()
+        _tickers = [c.ticker for c in _basket]
+        l1, l2, l3 = st.columns(3)
+        with l1:
+            _ticker = st.selectbox("Ticker", _tickers, key="journal_new_ticker")
+        with l2:
+            _instrument = st.selectbox("Instrument", ["OPTION", "STOCK"], key="journal_new_instrument")
+        with l3:
+            _direction = st.selectbox("Direction", ["BULLISH", "BEARISH"], key="journal_new_direction")
+
+        option_strategies = ["Long Call", "Long Put", "Bull Call Spread", "Bear Put Spread", "Bull Put Spread", "Bear Call Spread", "Custom Option"]
+        stock_strategies = ["Long Stock", "Short Stock"]
+        with st.form("journal_log_trade", clear_on_submit=False):
+            c1, c2 = st.columns(2)
+            with c1:
+                strategy = st.selectbox("Strategy", option_strategies if _instrument == "OPTION" else stock_strategies)
+                open_date = st.date_input("Entry date", value=date.today())
+                open_time = st.time_input("Entry time", value=datetime.now().time().replace(second=0, microsecond=0))
+                underlying_entry = st.number_input("Underlying entry price", min_value=0.0, value=0.0, step=0.01)
+                quantity = st.number_input("Contracts" if _instrument == "OPTION" else "Shares", min_value=0.01, value=1.0, step=1.0)
+                entry_type = st.selectbox("Entry cash flow", ["DEBIT", "CREDIT"], disabled=(_instrument == "STOCK"))
+                entry_value = st.number_input("Entry premium / price", min_value=0.0, value=0.0, step=0.01,
+                                              help="For an option spread enter the net debit/credit per share. For stock enter the share price.")
+                entry_fees = st.number_input("Entry fees", min_value=0.0, value=0.0, step=0.01)
+            with c2:
+                if _instrument == "OPTION":
+                    expiration = st.date_input("Expiration", value=date.today() + timedelta(days=35))
+                    long_option_type = st.selectbox("Long leg type", ["CALL", "PUT", "NONE"])
+                    long_strike = st.number_input("Long strike", min_value=0.0, value=0.0, step=0.5)
+                    short_option_type = st.selectbox("Short leg type", ["NONE", "CALL", "PUT"])
+                    short_strike = st.number_input("Short strike", min_value=0.0, value=0.0, step=0.5)
+                else:
+                    expiration = None; long_option_type = None; long_strike = 0.0; short_option_type = None; short_strike = 0.0
+                planned_max_loss = st.number_input("Planned max loss ($)", min_value=0.0, value=0.0, step=10.0)
+                planned_exit_date = st.date_input("Planned exit date", value=date.today() + timedelta(days=14))
+                stop_condition = st.text_input("Stop / invalidation", placeholder="e.g. close below support or spread <= $2.50")
+                profit_target = st.text_input("Profit target", placeholder="e.g. 60% of max profit")
+
+            thesis = st.text_area("Trade thesis", placeholder="Why are you taking this trade?")
+            tags = st.text_input("Tags", placeholder="momentum, breakout, low-iv")
+            notes = st.text_area("Notes")
+            submitted = st.form_submit_button("Log Trade", type="primary", use_container_width=True)
+            if submitted:
+                if entry_value <= 0:
+                    st.error("Entry premium / price must be greater than zero.")
+                else:
+                    try:
+                        _s = get_session()
+                        trade = create_trade(
+                            _s, ticker=_ticker, instrument_type=_instrument, direction=_direction,
+                            strategy=strategy, status="OPEN", opened_at=datetime.combine(open_date, open_time),
+                            thesis=thesis or None, tags=tags or None, notes=notes or None,
+                            underlying_entry=underlying_entry or None,
+                            expiration=expiration,
+                            long_option_type=None if long_option_type in (None, "NONE") else long_option_type,
+                            long_strike=long_strike or None,
+                            short_option_type=None if short_option_type in (None, "NONE") else short_option_type,
+                            short_strike=short_strike or None,
+                            quantity=float(quantity), multiplier=100 if _instrument == "OPTION" else 1,
+                            entry_type="DEBIT" if _instrument == "STOCK" else entry_type,
+                            entry_value=float(entry_value), entry_fees=float(entry_fees),
+                            planned_max_loss=planned_max_loss or None,
+                            stop_condition=stop_condition or None, profit_target=profit_target or None,
+                            planned_exit_date=planned_exit_date, current_value=float(entry_value), marked_at=datetime.utcnow(),
+                        )
+                        _s.close()
+                        st.success(f"Logged trade #{trade.id} · {trade.ticker} · {trade.strategy}. MktScan entry context was frozen with the journal record.")
+                        st.cache_data.clear()
+                    except Exception as exc:
+                        st.error(f"Could not log trade: {exc}")
+
+    with tab_manage:
+        if not _open:
+            st.info("No open positions to manage.")
+        else:
+            labels = {f"#{t.id} · {t.ticker} · {t.strategy} · {t.opened_at:%Y-%m-%d}": t.id for t in _open}
+            selected_label = st.selectbox("Open trade", list(labels), key="journal_manage_trade")
+            selected_id = labels[selected_label]
+            t = next(x for x in _open if x.id == selected_id)
+            m = trade_metrics(t, use_current=True)
+            a,b,c,d = st.columns(4)
+            a.metric("Entry", f"${t.entry_value:.2f}")
+            b.metric("Current mark", f"${t.current_value:.2f}" if t.current_value is not None else "—")
+            c.metric("Open P&L", f"${m.pnl:,.2f}" if m.pnl is not None else "—")
+            d.metric("Open ROR", f"{m.return_on_risk_pct:.1f}%" if m.return_on_risk_pct is not None else "—")
+
+            mtab, ctab = st.tabs(["Update Mark", "Close Trade"])
+            with mtab:
+                with st.form("journal_mark_form"):
+                    new_mark = st.number_input("Current option/spread value or stock price", min_value=0.0,
+                                               value=float(t.current_value if t.current_value is not None else t.entry_value), step=0.01)
+                    if st.form_submit_button("Save Mark"):
+                        _s = get_session(); obj = _s.get(TradeJournalEntry, selected_id)
+                        mark_trade(_s, obj, new_mark); _s.close()
+                        st.success("Current mark updated. Refresh the page to see the updated open-position metrics.")
+            with ctab:
+                with st.form("journal_close_form"):
+                    close_date = st.date_input("Exit date", value=date.today(), key="tj_close_date")
+                    close_time = st.time_input("Exit time", value=datetime.now().time().replace(second=0, microsecond=0), key="tj_close_time")
+                    underlying_exit = st.number_input("Underlying exit price", min_value=0.0, value=0.0, step=0.01)
+                    exit_value = st.number_input("Exit premium / price", min_value=0.0,
+                                                 value=float(t.current_value if t.current_value is not None else t.entry_value), step=0.01)
+                    exit_fees = st.number_input("Exit fees", min_value=0.0, value=0.0, step=0.01)
+                    exit_reason = st.selectbox("Exit reason", ["Profit target", "Stop loss", "Signal reversal", "Technical invalidation", "Time exit", "Pre-earnings exit", "Manual discretion", "Expiration", "Assignment", "Other"])
+                    close_notes = st.text_area("Closing notes", value=t.notes or "")
+                    if st.form_submit_button("Close Trade", type="primary"):
+                        _s = get_session(); obj = _s.get(TradeJournalEntry, selected_id)
+                        closed = close_trade(_s, obj, closed_at=datetime.combine(close_date, close_time),
+                                             underlying_exit=underlying_exit or None, exit_value=exit_value,
+                                             exit_fees=exit_fees, exit_reason=exit_reason, notes=close_notes)
+                        _s.close()
+                        st.success(f"Closed trade #{closed.id}: P&L ${closed.realized_pnl:,.2f} · ROR {closed.return_on_risk_pct:.1f}%" if closed.return_on_risk_pct is not None else f"Closed trade #{closed.id}: P&L ${closed.realized_pnl:,.2f}")
+                        st.cache_data.clear()
+
+    with tab_history:
+        if not _trades:
+            st.info("No journal history yet.")
+        else:
+            f1,f2,f3,f4 = st.columns(4)
+            tick_opts = ["All"] + sorted({t.ticker for t in _trades})
+            strat_opts = ["All"] + sorted({t.strategy for t in _trades})
+            with f1: ft = st.selectbox("Ticker", tick_opts, key="tj_hist_ticker")
+            with f2: fs = st.selectbox("Strategy", strat_opts, key="tj_hist_strategy")
+            with f3: fstatus = st.selectbox("Status", ["All", "OPEN", "CLOSED"], key="tj_hist_status")
+            with f4: fresult = st.selectbox("Result", ["All", "Winners", "Losers"], key="tj_hist_result")
+            hist = []
+            for t in _trades:
+                if ft != "All" and t.ticker != ft: continue
+                if fs != "All" and t.strategy != fs: continue
+                if fstatus != "All" and t.status != fstatus: continue
+                m = trade_metrics(t, use_current=(t.status == "OPEN"))
+                if fresult == "Winners" and (m.pnl is None or m.pnl <= 0): continue
+                if fresult == "Losers" and (m.pnl is None or m.pnl >= 0): continue
+                hist.append({"ID":t.id,"Opened":t.opened_at,"Closed":t.closed_at,"Ticker":t.ticker,"Strategy":t.strategy,"Status":t.status,
+                             "P&L":m.pnl,"ROR %":m.return_on_risk_pct,"Hold d":m.holding_days,"Score":t.tradeability_score,
+                             "Regime":t.regime_label,"IV Pct":t.iv_percentile,"Exit Reason":t.exit_reason,"Tags":t.tags})
+            st.dataframe(pd.DataFrame(hist), use_container_width=True, hide_index=True,
+                         column_config={"P&L":st.column_config.NumberColumn(format="$%.2f"),"ROR %":st.column_config.NumberColumn(format="%.1f%%"),"Score":st.column_config.NumberColumn(format="%.3f"),"IV Pct":st.column_config.NumberColumn(format="%.0f")})
+
+            if hist:
+                ids = {f"#{row['ID']} · {row['Ticker']} · {row['Strategy']}": row['ID'] for row in hist}
+                detail_label = st.selectbox("Trade detail", list(ids), key="tj_detail")
+                dtrade = next(t for t in _trades if t.id == ids[detail_label])
+                with st.expander("Entry snapshot", expanded=True):
+                    q1,q2,q3,q4 = st.columns(4)
+                    q1.metric("Tradeability", f"{dtrade.tradeability_score:+.3f}" if dtrade.tradeability_score is not None else "—")
+                    q2.metric("Regime", dtrade.regime_label or "—")
+                    q3.metric("IV Percentile", f"{dtrade.iv_percentile:.0f}" if dtrade.iv_percentile is not None else "—")
+                    q4.metric("Expected Move", f"±{dtrade.expected_move_pct:.1f}%" if dtrade.expected_move_pct is not None else "—")
+                    st.caption(f"IV source: {dtrade.options_source or '—'} · IV Rank: {dtrade.iv_rank if dtrade.iv_rank is not None else '—'} · Put skew: {dtrade.put_skew if dtrade.put_skew is not None else '—'} · Call skew: {dtrade.call_skew if dtrade.call_skew is not None else '—'}")
+                    if dtrade.thesis: st.markdown(f"**Thesis:** {dtrade.thesis}")
+                    if dtrade.notes: st.markdown(f"**Notes:** {dtrade.notes}")
+
+    with tab_perf:
+        if not _closed:
+            st.info("Close at least one trade to populate performance analytics.")
+        else:
+            pdata = []
+            for t in _closed:
+                m = trade_metrics(t)
+                if m.pnl is None: continue
+                pdata.append({"id":t.id,"date":t.closed_at,"ticker":t.ticker,"strategy":t.strategy,"pnl":m.pnl,"ror":m.return_on_risk_pct,
+                              "regime":t.regime_label or "Unknown","iv_bucket":iv_bucket(t.iv_percentile),"score_bucket":score_bucket(t.tradeability_score),"exit_reason":t.exit_reason or "Unknown"})
+            pdf = pd.DataFrame(pdata)
+            if pdf.empty:
+                st.info("Closed trades do not yet have enough pricing data for performance calculations.")
+            else:
+                wins = pdf[pdf.pnl > 0]; losses = pdf[pdf.pnl < 0]
+                total = float(pdf.pnl.sum()); n=len(pdf); wr=len(wins)/n*100 if n else 0
+                avg_win=float(wins.pnl.mean()) if len(wins) else 0; avg_loss=float(losses.pnl.mean()) if len(losses) else 0
+                gross_win=float(wins.pnl.sum()); gross_loss=abs(float(losses.pnl.sum()))
+                pf=gross_win/gross_loss if gross_loss>0 else None
+                expectancy=float(pdf.pnl.mean())
+                avg_ror=float(pdf.ror.dropna().mean()) if pdf.ror.notna().any() else None
+                k1,k2,k3,k4,k5,k6 = st.columns(6)
+                k1.metric("Net P&L", f"${total:,.0f}")
+                k2.metric("Closed Trades", f"{n}")
+                k3.metric("Win Rate", f"{wr:.1f}%")
+                k4.metric("Profit Factor", f"{pf:.2f}" if pf is not None else "—")
+                k5.metric("Expectancy", f"${expectancy:,.0f}/trade")
+                k6.metric("Avg ROR", f"{avg_ror:.1f}%" if avg_ror is not None else "—")
+                st.caption(f"Average winner ${avg_win:,.0f} · Average loser ${avg_loss:,.0f}")
+
+                curve = pdf.sort_values("date").copy(); curve["Equity P&L"] = curve.pnl.cumsum()
+                st.plotly_chart(px.line(curve, x="date", y="Equity P&L", markers=True, title="Cumulative Realized P&L"), use_container_width=True)
+
+                st.subheader("Performance Attribution")
+                for title, col in [("By Strategy","strategy"),("By Market Regime","regime"),("By IV Percentile","iv_bucket"),("By Tradeability Magnitude","score_bucket"),("By Exit Reason","exit_reason")]:
+                    with st.expander(title, expanded=(col in {"strategy","regime"})):
+                        grp = pdf.groupby(col, dropna=False).agg(Trades=("pnl","size"), Net_PnL=("pnl","sum"), Avg_PnL=("pnl","mean"), Win_Rate=("pnl",lambda x:(x>0).mean()*100), Avg_ROR=("ror","mean")).reset_index()
+                        st.dataframe(grp, use_container_width=True, hide_index=True,
+                                     column_config={"Net_PnL":st.column_config.NumberColumn("Net P&L",format="$%.2f"),"Avg_PnL":st.column_config.NumberColumn("Avg P&L",format="$%.2f"),"Win_Rate":st.column_config.NumberColumn("Win Rate",format="%.1f%%"),"Avg_ROR":st.column_config.NumberColumn("Avg ROR",format="%.1f%%")})
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
