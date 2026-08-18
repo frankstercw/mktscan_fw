@@ -198,6 +198,26 @@ def cached_technical_opportunity(ticker: str):
     from mktscan.terminal import technical_opportunity
     return technical_opportunity(ticker)
 
+# ── Navigation callbacks ───────────────────────────────────────────────────────
+def _navigate(page_name: str, ticker: str | None = None):
+    """Update widget-backed navigation state safely from a Streamlit callback.
+
+    Streamlit forbids mutating a session-state key after the widget that owns
+    that key has been instantiated in the current run. Button callbacks execute
+    before the next script rerun, so this is the supported way to change both
+    the global ticker selectbox and the navigation radio from page content.
+    """
+    if ticker:
+        st.session_state["global_ticker"] = ticker
+    st.session_state["main_navigation"] = page_name
+
+
+def _open_journal_from_workspace(ticker: str, strategy: str = ""):
+    st.session_state["journal_prefill_ticker"] = ticker
+    st.session_state["journal_prefill_strategy"] = strategy
+    _navigate("Trade Journal", ticker)
+
+
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## 📡 MktScan")
@@ -348,8 +368,12 @@ if page == "Today":
     st.subheader("Opportunities")
     st.dataframe(df[["Ticker","Setup","Signal","Score","Confidence","IV","Regime","Event"]],use_container_width=True,hide_index=True,column_config={"Score":st.column_config.NumberColumn(format="%+.3f"),"Confidence":st.column_config.ProgressColumn(min_value=0,max_value=1,format="%.0%%")})
     pick=st.selectbox("Review ticker",df['Ticker'].tolist() if not df.empty else [st.session_state.get('global_ticker')],key='today_pick')
-    if st.button("Open Workspace",type="primary"):
-        st.session_state['global_ticker']=pick; st.session_state['main_navigation']='Workspace'; st.rerun()
+    st.button(
+        "Open Workspace",
+        type="primary",
+        on_click=_navigate,
+        args=("Workspace", pick),
+    )
 
 elif page == "Workspace":
     ticker=st.session_state.get('global_ticker')
@@ -409,8 +433,11 @@ elif page == "Workspace":
             b1,b2,b3,b4,b5=st.columns(5); b1.metric("Structure",setup.get('structure','—').replace('_',' ').title()); b2.metric("Cost/Credit",f"${abs(setup.get('cost_per_contract') or 0):,.0f}"); b3.metric("Max Loss",f"${setup.get('max_loss_per_contract'):,.0f}" if setup.get('max_loss_per_contract') is not None else '—'); b4.metric("Max Profit",f"${setup.get('max_profit_per_contract'):,.0f}" if setup.get('max_profit_per_contract') is not None else '—'); b5.metric("Breakeven",f"${setup.get('breakeven'):,.2f}" if setup.get('breakeven') else '—')
             st.dataframe(pd.DataFrame(setup.get('legs',[])),use_container_width=True,hide_index=True)
             st.caption(f"Net Δ {setup.get('net_delta','—')} · Θ/day ${setup.get('net_theta_per_day_per_contract','—')} · Vega {setup.get('net_vega_per_contract','—')} · Confidence {setup.get('confidence_tier','—')}")
-            if st.button("Log this trade in Journal"):
-                st.session_state['journal_prefill_ticker']=ticker; st.session_state['journal_prefill_strategy']=setup.get('structure',''); st.session_state['main_navigation']='Trade Journal'; st.rerun()
+            st.button(
+                "Log this trade in Journal",
+                on_click=_open_journal_from_workspace,
+                args=(ticker, setup.get("structure", "")),
+            )
         else: st.warning(setup.get('reason') or setup.get('error') or 'No tradeable setup.')
     st.caption("Live chart remains available on the Live Charts page; the global ticker is already synchronized.")
 

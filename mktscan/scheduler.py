@@ -12,6 +12,33 @@ from typing import Any
 log = logging.getLogger(__name__)
 
 
+def _trigger_from_expr(expr: str, *, default: str):
+    """Build an APScheduler trigger from five-part cron or */N shorthand."""
+    from apscheduler.triggers.cron import CronTrigger
+    from apscheduler.triggers.interval import IntervalTrigger
+
+    cron_expr = (expr or default).strip()
+    interval_match = re.match(r"^\*/(\d+)\s+\*\s+\*\s+\*\s+\*$", cron_expr)
+    if interval_match:
+        mins = int(interval_match.group(1))
+        return IntervalTrigger(minutes=mins), f"every {mins} minute{'s' if mins != 1 else ''}"
+
+    parts = cron_expr.split()
+    if len(parts) != 5:
+        raise ValueError(
+            f"Invalid cron expression: '{cron_expr}'. "
+            "Use 5-part cron (min hour day month dow) or '*/N * * * *'."
+        )
+    minute, hour, day, month, day_of_week = parts
+    return (
+        CronTrigger(
+            minute=minute, hour=hour, day=day, month=month,
+            day_of_week=day_of_week, timezone="UTC",
+        ),
+        f"cron: {cron_expr}",
+    )
+
+
 def run_scheduled(cfg: dict[str, Any] | None = None, interval_minutes: int | None = None):
     """
     Start the scheduler. Blocks until interrupted (Ctrl+C).
@@ -37,34 +64,21 @@ def run_scheduled(cfg: dict[str, Any] | None = None, interval_minutes: int | Non
     console = Console()
     cfg     = cfg or get_config()
 
-    # ── Determine trigger ─────────────────────────────────────────────────────
+    # ── Determine triggers ───────────────────────────────────────────────────
     if interval_minutes is not None:
-        # Explicit interval override
-        trigger      = IntervalTrigger(minutes=interval_minutes)
+        from apscheduler.triggers.interval import IntervalTrigger
+        trigger = IntervalTrigger(minutes=interval_minutes)
         trigger_desc = f"every {interval_minutes} minute{'s' if interval_minutes != 1 else ''}"
     else:
-        cron_expr = cfg.get("scraper", {}).get("schedule", "*/15 * * * *")
+        trigger, trigger_desc = _trigger_from_expr(
+            cfg.get("scraper", {}).get("schedule", "*/30 13-21 * * 1-5"),
+            default="*/30 13-21 * * 1-5",
+        )
 
-        # Detect simple interval patterns like "*/15 * * * *" or "*/5 * * * *"
-        interval_match = re.match(r"^\*/(\d+)\s+\*\s+\*\s+\*\s+\*$", cron_expr.strip())
-        if interval_match:
-            mins    = int(interval_match.group(1))
-            trigger = IntervalTrigger(minutes=mins)
-            trigger_desc = f"every {mins} minute{'s' if mins != 1 else ''}"
-        else:
-            # Full cron expression
-            parts = cron_expr.strip().split()
-            if len(parts) != 5:
-                raise ValueError(
-                    f"Invalid cron expression: '{cron_expr}'. "
-                    "Use 5-part cron (min hour day month dow) or '*/N * * * *' for interval."
-                )
-            minute, hour, day, month, day_of_week = parts
-            trigger = CronTrigger(
-                minute=minute, hour=hour,
-                day=day, month=month, day_of_week=day_of_week,
-            )
-            trigger_desc = f"cron: {cron_expr}"
+    price_trigger, price_trigger_desc = _trigger_from_expr(
+        cfg.get("scraper", {}).get("price_schedule", "*/10 13-21 * * 1-5"),
+        default="*/10 13-21 * * 1-5",
+    )
 
     # ── Job ───────────────────────────────────────────────────────────────────
     run_count = [0]
@@ -89,6 +103,42 @@ def run_scheduled(cfg: dict[str, Any] | None = None, interval_minutes: int | Non
         except Exception as e:
             console.print(f"[red]✗ Run #{run_count[0]} failed: {e}[/red]")
             log.exception("Scheduled run failed")
+
+    def price_job():
+        """Lightweight price + market-regime refresh between full scrapes."""
+        console.print("[cyan]▶ Price/regime refresh...[/cyan]")
+        try:
+            result = ScrapeEngine(cfg).run(mode="prices")
+            console.print(
+                f"[green]✓ Price refresh complete[/green] — "
+                f"{result.get('elapsed_seconds', 0):.0f}s"
+            )
+            if result.get("errors"):
+                for err in result["errors"][:3]:
+                    console.print(f"  [yellow]⚠ {err}[/yellow]")
+        except Exception as exc:
+            console.print(f"[red]✗ Price refresh failed: {exc}[/red]")
+            log.exception("Scheduled price refresh failed")
+
+    def iv_seed_job():
+        """Seed IV history asynchronously so it can never block the scheduler boot."""
+        try:
+            from .database import get_session, get_basket
+            from .iv_rank import compute_iv_rank, backfill_iv_history
+
+            session = get_session()
+            try:
+                tickers = [c.ticker for c in get_basket(session)]
+                if tickers and compute_iv_rank(session, tickers[0])["basis"] == "none":
+                    console.print("[cyan]▶ No IV history found — background seed starting...[/cyan]")
+                    backfill_iv_history(session, tickers, days=365)
+                    iv_snapshot_job()
+                    console.print("[green]✓ IV history seed complete[/green]")
+            finally:
+                session.close()
+        except Exception as exc:
+            console.print(f"[yellow]⚠ IV history seed skipped: {exc}[/yellow]")
+            log.warning("IV history seed skipped: %s", exc)
 
     def iv_snapshot_job():
         """
@@ -159,8 +209,18 @@ def run_scheduled(cfg: dict[str, Any] | None = None, interval_minutes: int | Non
         trigger=trigger,
         id="mktscan_scrape",
         name="MktScan full scrape",
-        misfire_grace_time=120,   # if a run is missed by <2min, still execute it
-        coalesce=True,            # if multiple missed runs pile up, only run once
+        misfire_grace_time=300,
+        coalesce=True,
+        max_instances=1,
+    )
+    scheduler.add_job(
+        price_job,
+        trigger=price_trigger,
+        id="mktscan_prices",
+        name="MktScan price/regime refresh",
+        misfire_grace_time=180,
+        coalesce=True,
+        max_instances=1,
     )
 
     from apscheduler.triggers.cron import CronTrigger as _CronTrigger
@@ -185,6 +245,19 @@ def run_scheduled(cfg: dict[str, Any] | None = None, interval_minutes: int | Non
         coalesce=True,
     )
 
+    # Seed IV history shortly after the scheduler starts. A historical Yahoo
+    # backfill can take many minutes or get rate-limited, so it must never sit
+    # on the critical path before recurring jobs are registered.
+    from datetime import datetime as _dt, timedelta as _td
+    scheduler.add_job(
+        iv_seed_job,
+        trigger="date",
+        run_date=_dt.utcnow() + _td(seconds=20),
+        id="mktscan_iv_seed",
+        name="MktScan one-time IV seed check",
+        misfire_grace_time=3600,
+    )
+
     # ── Health check HTTP server (required by Railway) ───────────────────────
     import os as _os, threading as _threading
     from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -206,34 +279,17 @@ def run_scheduled(cfg: dict[str, Any] | None = None, interval_minutes: int | Non
     except Exception as _he:
         console.print(f"[yellow]⚠ Health server error: {_he}[/yellow]")
 
-    console.print(f"[bold cyan]MktScan Scheduler[/bold cyan] — {trigger_desc} (UTC)")
+    console.print(f"[bold cyan]MktScan Scheduler[/bold cyan] — full refresh {trigger_desc} (UTC)")
+    console.print(f"[dim]  + price/regime refresh {price_trigger_desc} (UTC)[/dim]")
     console.print("[dim]  + daily IV snapshot at 21:15 UTC (weekdays)[/dim]")
     console.print("[dim]  + weekly backtest Sunday 02:00 UTC[/dim]")
     console.print("[dim]Press Ctrl+C to stop[/dim]")
 
-    # Run once immediately on startup so you don't wait for the first interval.
+    # One initial full run gives the dashboard fresh data immediately. The
+    # potentially slow IV backfill now runs asynchronously after the scheduler
+    # has started, so it cannot prevent recurring jobs from being registered.
     console.print("[cyan]Running initial scrape on startup...[/cyan]")
     job()
-
-    # Seed IV history on first boot. Without at least one snapshot the IV rank —
-    # and therefore the whole strategy selector — has nothing to work with, and
-    # waiting for 21:15 UTC would leave the tool degraded until then.
-    try:
-        from .database import get_session, get_basket
-        from .iv_rank import compute_iv_rank
-
-        session = get_session()
-        try:
-            tickers = [c.ticker for c in get_basket(session)]
-            if tickers and compute_iv_rank(session, tickers[0])["basis"] == "none":
-                console.print("[cyan]No IV history found — seeding...[/cyan]")
-                from .iv_rank import backfill_iv_history
-                backfill_iv_history(session, tickers, days=365)
-                iv_snapshot_job()
-        finally:
-            session.close()
-    except Exception as e:
-        console.print(f"[yellow]⚠ IV history seed skipped: {e}[/yellow]")
 
     try:
         scheduler.start()

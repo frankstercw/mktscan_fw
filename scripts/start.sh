@@ -65,27 +65,7 @@ if [[ "${ROLE}" == "scheduler" ]]; then
   echo "→ Seeding basket if empty..."
   python -m mktscan basket >/dev/null 2>&1 || true
 
-  echo "→ Checking implied-volatility history..."
-  python - <<'PY' || echo "  IV seed skipped"
-from mktscan.database import get_session, get_basket, init_db
-from mktscan.iv_rank import backfill_iv_history, compute_iv_rank, update_iv_snapshot
-
-init_db()
-session = get_session()
-try:
-    tickers = [c.ticker for c in get_basket(session)]
-    if not tickers:
-        print("  no basket yet — skipping")
-    elif compute_iv_rank(session, tickers[0])["basis"] == "none":
-        print(f"  no IV history — seeding {len(tickers)} tickers (several minutes)")
-        backfill_iv_history(session, tickers, days=365)
-        update_iv_snapshot(session, tickers)
-        print("  IV seed complete")
-    else:
-        print("  IV history present")
-finally:
-    session.close()
-PY
+  echo "→ IV history seed will run in background after scheduler startup"
 
   echo "→ Starting scheduler"
   exec python -m mktscan schedule

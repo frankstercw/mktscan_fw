@@ -9,7 +9,12 @@ scraper:
   # overnight and weekends, when neither prices nor news change — and each run
   # re-fetched every source for every ticker. Predictions and IV snapshots are
   # deduplicated to one per day regardless, so the extra runs bought nothing.
+  # Full news/sentiment/tradeability refresh. Keep this relatively slow because
+  # it touches every external source in the basket.
   schedule: "*/30 13-21 * * 1-5"
+  # Lightweight Yahoo price/regime refresh. This is intentionally more frequent
+  # than the full scrape so dashboard prices and regime context do not look stale.
+  price_schedule: "*/10 13-21 * * 1-5"
   user_agent: "MktScan/1.0 (personal research tool)"
   timeout_seconds: 15
 
