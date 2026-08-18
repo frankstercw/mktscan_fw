@@ -551,3 +551,9 @@ cached for 15 seconds to avoid repeated requests on normal Streamlit reruns.
 The dashboard includes a manual Trade Journal for recording real stock and option trades. At entry, MktScan freezes the latest tradeability, market-regime, and options-market context available at or before the trade timestamp. Open positions support manual marking; closed positions calculate realized P&L, return on risk, and holding period. Performance views include cumulative P&L and attribution by strategy, market regime, IV percentile, tradeability bucket, and exit reason.
 
 Deploy schema changes with `alembic upgrade head` (migration `0004_trade_journal.py`).
+
+## Decision Terminal polish
+
+The dashboard now includes a decision-first **Today** page and a synchronized **Workspace** ticker context. Today compresses the basket into setup quality, semantic signal, confidence, IV state, regime, and event risk. Workspace combines technical opportunity (trend, momentum acceleration, relative strength, RVOL), an Alpaca intraday chart, Options Market interpretation, and the existing option trade builder. The Trade Journal adds model-vs-trader attribution and portfolio risk/concentration views.
+
+These presentation layers do not change the underlying tradeability model weights. Setup Quality is intentionally a workflow heuristic until journal/backtest evidence supports calibration.

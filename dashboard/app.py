@@ -193,6 +193,11 @@ def cached_sidebar_stats() -> dict:
         session.close()
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_technical_opportunity(ticker: str):
+    from mktscan.terminal import technical_opportunity
+    return technical_opportunity(ticker)
+
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## 📡 MktScan")
@@ -201,9 +206,19 @@ with st.sidebar:
 
     page = st.radio(
         "Navigation",
-        ["Dashboard", "Tradeability", "Live Charts", "Options Market", "Trade Journal", "News Feed", "Earnings", "Economic Calendar", "Basket", "Backtest", "Data Definitions", "Run Scraper"],
+        ["Today", "Workspace", "Dashboard", "Tradeability", "Live Charts", "Options Market", "Trade Journal", "News Feed", "Earnings", "Economic Calendar", "Basket", "Backtest", "Data Definitions", "Run Scraper"],
         label_visibility="collapsed",
+        key="main_navigation",
     )
+
+    # Global ticker context shared by Today/Workspace and used as the default elsewhere.
+    _ctx_session = get_session()
+    _ctx_tickers = [c.ticker for c in get_basket(_ctx_session)]
+    _ctx_session.close()
+    if _ctx_tickers:
+        if st.session_state.get("global_ticker") not in _ctx_tickers:
+            st.session_state["global_ticker"] = _ctx_tickers[0]
+        st.selectbox("Global ticker", _ctx_tickers, key="global_ticker", help="Shared ticker context for the decision workflow.")
 
     st.divider()
 
@@ -298,7 +313,108 @@ def score_bar_html(score: float, width: int = 120) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 # DASHBOARD PAGE
 # ═══════════════════════════════════════════════════════════════════════════════
-if page == "Dashboard":
+if page == "Today":
+    st.title("Today")
+    st.caption("Decision-first view: market context, portfolio state, and the basket names that deserve attention.")
+    from mktscan.database import OptionsMarketSnapshot, TradeabilityOutcome, TradeJournalEntry
+    from mktscan.terminal import semantic_signal, iv_state, setup_quality
+    from mktscan.trade_journal import trade_metrics
+    _s=get_session(); _reg=cached_market_regime(); _basket=get_basket(_s)
+    _open=_s.execute(select(TradeJournalEntry).where(TradeJournalEntry.status=="OPEN")).scalars().all()
+    _closed=_s.execute(select(TradeJournalEntry).where(TradeJournalEntry.status=="CLOSED")).scalars().all()
+    _open_pnl=sum((trade_metrics(t, use_current=True).pnl or 0) for t in _open)
+    _risk=sum(float(t.planned_max_loss or 0) for t in _open)
+    _next_event=_reg.next_macro_event if _reg else None
+    h1,h2,h3,h4,h5,h6=st.columns(6)
+    h1.metric("Market", (_reg.regime_label or "UNKNOWN").replace("_"," ") if _reg else "UNKNOWN")
+    h2.metric("VIX", f"{_reg.vix:.1f}" if _reg and _reg.vix is not None else "—", (_reg.volatility_state or "").replace("_"," ") if _reg else None)
+    h3.metric("Open P&L", f"${_open_pnl:,.0f}")
+    h4.metric("Capital at Risk", f"${_risk:,.0f}")
+    h5.metric("Positions", len(_open))
+    h6.metric("Next Event", _next_event or "None", f"{_reg.hours_to_macro:.0f}h" if _reg and _reg.hours_to_macro is not None else None)
+    st.divider()
+    with st.spinner("Ranking basket opportunities…"):
+        _results=cached_tradeability()
+    _opts={r.ticker:r for r in _s.execute(select(OptionsMarketSnapshot).order_by(OptionsMarketSnapshot.snapshot_date.desc())).scalars().all() if r.ticker not in locals().get('_seen',set())}
+    rows=[]
+    for c in _basket:
+        r=_results.get(c.ticker) or {}; om=_opts.get(c.ticker); score=r.get('score'); cov=r.get('coverage')
+        q=setup_quality(score,cov,_reg.regime_label if _reg else None,None,om.iv_percentile_1y if om else None,r.get('days_to_earnings'))
+        rows.append({"Ticker":c.ticker,"Setup":q['label'],"Signal":semantic_signal(score),"Score":score,"Confidence":cov,"IV":iv_state(om.iv_percentile_1y if om else None),"Regime":(_reg.regime_label or 'UNKNOWN').replace('_',' ') if _reg else 'UNKNOWN',"Event":f"E {r.get('days_to_earnings')}d" if r.get('days_to_earnings') is not None and r.get('days_to_earnings')<=14 else "—","Quality":q['score']})
+    _s.close(); df=pd.DataFrame(rows).sort_values(["Quality","Score"],ascending=[False,False])
+    f1,f2=st.columns([1,3]); minq=f1.select_slider("Minimum setup",options=["ALL","LOW","MODERATE","HIGH"],value="MODERATE")
+    if minq!="ALL":
+        order={"LOW":1,"MODERATE":2,"HIGH":3}; df=df[df['Setup'].map(order)>=order[minq]]
+    st.subheader("Opportunities")
+    st.dataframe(df[["Ticker","Setup","Signal","Score","Confidence","IV","Regime","Event"]],use_container_width=True,hide_index=True,column_config={"Score":st.column_config.NumberColumn(format="%+.3f"),"Confidence":st.column_config.ProgressColumn(min_value=0,max_value=1,format="%.0%%")})
+    pick=st.selectbox("Review ticker",df['Ticker'].tolist() if not df.empty else [st.session_state.get('global_ticker')],key='today_pick')
+    if st.button("Open Workspace",type="primary"):
+        st.session_state['global_ticker']=pick; st.session_state['main_navigation']='Workspace'; st.rerun()
+
+elif page == "Workspace":
+    ticker=st.session_state.get('global_ticker')
+    st.title(f"{ticker} Workspace")
+    st.caption("One ticker, one workflow: signal → technical confirmation → options context → trade construction.")
+    from mktscan.terminal import setup_quality, semantic_signal, iv_state
+    from mktscan.options_market import latest_options_market
+    from mktscan.options_interpretation import interpret_options_market
+    _s=get_session(); _results=cached_tradeability(); r=_results.get(ticker,{})
+    om=latest_options_market(_s,ticker); reg=cached_market_regime()
+    with st.spinner("Loading technical opportunity…"):
+        tech=cached_technical_opportunity(ticker)
+    q=setup_quality(r.get('score'),r.get('coverage'),reg.regime_label if reg else None,tech,om.iv_percentile_1y if om else None,r.get('days_to_earnings'))
+    a,b,c,d,e=st.columns(5)
+    a.metric("Setup Quality",q['label'],f"{q['score']}/100")
+    b.metric("Signal",semantic_signal(r.get('score')),f"{r.get('score',0):+.3f}")
+    c.metric("Confidence",f"{(r.get('coverage') or 0):.0%}")
+    d.metric("Market",(reg.regime_label or 'UNKNOWN').replace('_',' ') if reg else 'UNKNOWN')
+    e.metric("IV",iv_state(om.iv_percentile_1y if om else None),f"{om.iv_percentile_1y:.0f} pct" if om and om.iv_percentile_1y is not None else '—')
+    if q['strengths']: st.success("Strengths: " + " · ".join(q['strengths']))
+    if q['risks']: st.warning("Risks: " + " · ".join(q['risks']))
+    t1,t2,t3,t4=st.columns(4)
+    t1.metric("Trend",tech.trend_state); t2.metric("Momentum",tech.momentum_state); t3.metric("Relative Strength",tech.relative_strength_state); t4.metric("Volume",tech.volume_state, f"RVOL {tech.rvol20:.2f}×" if tech.rvol20 else None)
+    with st.expander("Technical details",expanded=False):
+        st.write({"RSI 14":tech.rsi14,"ADX 14":tech.adx14,"5d return %":tech.return_5d,"20d return %":tech.return_20d,"20d vs SPY %":tech.rs_spy_20d,"20d vs QQQ %":tech.rs_qqq_20d,"Momentum acceleration":tech.momentum_acceleration})
+    st.subheader("Live Price")
+    if os.getenv("ALPACA_API_KEY") or os.getenv("APCA_API_KEY_ID"):
+        try:
+            from mktscan.providers.alpaca import AlpacaMarketDataClient
+            from mktscan.live_charts import chart_window, prepare_chart_bars
+            _client=AlpacaMarketDataClient(); _cfg,_start,_end=chart_window("1D")
+            _bars=prepare_chart_bars(_client.get_bars(ticker, timeframe=_cfg.timeframe, start=_start, end=_end, limit=_cfg.max_bars),"1D")
+            _quote=_client.get_quote(ticker)
+            if not _bars.empty:
+                _x=_bars['market_time']; _fig=go.Figure(go.Candlestick(x=_x,open=_bars['open'],high=_bars['high'],low=_bars['low'],close=_bars['close'],name=ticker))
+                _fig.add_trace(go.Scatter(x=_x,y=_bars['ema_9'],name='EMA 9')); _fig.add_trace(go.Scatter(x=_x,y=_bars['ema_20'],name='EMA 20')); _fig.add_trace(go.Scatter(x=_x,y=_bars['vwap'],name='VWAP'))
+                if om and om.expected_move_dollars and _quote.last:
+                    _fig.add_hline(y=_quote.last+om.expected_move_dollars,line_dash='dot',annotation_text='+ implied move'); _fig.add_hline(y=_quote.last-om.expected_move_dollars,line_dash='dot',annotation_text='- implied move')
+                _fig.update_layout(height=430,xaxis_rangeslider_visible=False,margin=dict(l=10,r=10,t=20,b=10),hovermode='x unified')
+                st.plotly_chart(_fig,use_container_width=True)
+        except Exception as exc: st.caption(f"Live chart unavailable: {exc}")
+    else: st.info("Configure Alpaca credentials to embed the live intraday chart here.")
+    st.subheader("Options Context")
+    if om:
+        interp=interpret_options_market(om,r.get('score'),r.get('label'))
+        o1,o2,o3,o4=st.columns(4); o1.metric("ATM IV",f"{om.atm_iv*100:.1f}%" if om.atm_iv else '—'); o2.metric("IV Percentile",f"{om.iv_percentile_1y:.0f}" if om.iv_percentile_1y is not None else '—'); o3.metric("Term",om.term_state or '—'); o4.metric("Expected Move",f"±{om.expected_move_pct:.1f}%" if om.expected_move_pct is not None else '—')
+        st.info(f"{interp.structure_bias}: {interp.thesis}")
+    else: st.info("No Options Market snapshot yet for this ticker.")
+    st.subheader("Trade Builder")
+    if st.button("Build live option setup",type="primary",key='workspace_build'):
+        with st.spinner("Fetching live chain and constructing trade…"):
+            try: st.session_state['workspace_setup']=generate_basket_setups({ticker:r}).get(ticker)
+            except Exception as exc: st.error(str(exc))
+    setup=st.session_state.get('workspace_setup')
+    if setup and setup.get('ticker')==ticker:
+        if setup.get('tradeable'):
+            b1,b2,b3,b4,b5=st.columns(5); b1.metric("Structure",setup.get('structure','—').replace('_',' ').title()); b2.metric("Cost/Credit",f"${abs(setup.get('cost_per_contract') or 0):,.0f}"); b3.metric("Max Loss",f"${setup.get('max_loss_per_contract'):,.0f}" if setup.get('max_loss_per_contract') is not None else '—'); b4.metric("Max Profit",f"${setup.get('max_profit_per_contract'):,.0f}" if setup.get('max_profit_per_contract') is not None else '—'); b5.metric("Breakeven",f"${setup.get('breakeven'):,.2f}" if setup.get('breakeven') else '—')
+            st.dataframe(pd.DataFrame(setup.get('legs',[])),use_container_width=True,hide_index=True)
+            st.caption(f"Net Δ {setup.get('net_delta','—')} · Θ/day ${setup.get('net_theta_per_day_per_contract','—')} · Vega {setup.get('net_vega_per_contract','—')} · Confidence {setup.get('confidence_tier','—')}")
+            if st.button("Log this trade in Journal"):
+                st.session_state['journal_prefill_ticker']=ticker; st.session_state['journal_prefill_strategy']=setup.get('structure',''); st.session_state['main_navigation']='Trade Journal'; st.rerun()
+        else: st.warning(setup.get('reason') or setup.get('error') or 'No tradeable setup.')
+    st.caption("Live chart remains available on the Live Charts page; the global ticker is already synchronized.")
+
+elif page == "Dashboard":
     st.title("Market Dashboard")
 
     session = get_session()
@@ -2856,8 +2972,8 @@ elif page == "Trade Journal":
     _open = [t for t in _trades if t.status == "OPEN"]
     _closed = [t for t in _trades if t.status == "CLOSED"]
 
-    tab_open, tab_log, tab_manage, tab_history, tab_perf = st.tabs(
-        ["Open Positions", "Log Trade", "Manage Trade", "Trade History", "Performance"]
+    tab_open, tab_log, tab_manage, tab_history, tab_perf, tab_review, tab_risk = st.tabs(
+        ["Open Positions", "Log Trade", "Manage Trade", "Trade History", "Performance", "Trade Review", "Portfolio Risk"]
     )
 
     with tab_open:
@@ -2894,7 +3010,9 @@ elif page == "Trade Journal":
         _tickers = [c.ticker for c in _basket]
         l1, l2, l3 = st.columns(3)
         with l1:
-            _ticker = st.selectbox("Ticker", _tickers, key="journal_new_ticker")
+            _prefill_ticker = st.session_state.pop("journal_prefill_ticker", None)
+            _ticker_index = _tickers.index(_prefill_ticker) if _prefill_ticker in _tickers else 0
+            _ticker = st.selectbox("Ticker", _tickers, index=_ticker_index, key="journal_new_ticker")
         with l2:
             _instrument = st.selectbox("Instrument", ["OPTION", "STOCK"], key="journal_new_instrument")
         with l3:
@@ -3082,6 +3200,56 @@ elif page == "Trade Journal":
                         grp = pdf.groupby(col, dropna=False).agg(Trades=("pnl","size"), Net_PnL=("pnl","sum"), Avg_PnL=("pnl","mean"), Win_Rate=("pnl",lambda x:(x>0).mean()*100), Avg_ROR=("ror","mean")).reset_index()
                         st.dataframe(grp, use_container_width=True, hide_index=True,
                                      column_config={"Net_PnL":st.column_config.NumberColumn("Net P&L",format="$%.2f"),"Avg_PnL":st.column_config.NumberColumn("Avg P&L",format="$%.2f"),"Win_Rate":st.column_config.NumberColumn("Win Rate",format="%.1f%%"),"Avg_ROR":st.column_config.NumberColumn("Avg ROR",format="%.1f%%")})
+
+
+    with tab_review:
+        st.subheader("Model vs Trader Attribution")
+        st.caption("Separates directional thesis quality from trade-structure/execution outcome using closed journal trades.")
+        if not _closed:
+            st.info("Close at least one trade to review attribution.")
+        else:
+            review_rows=[]
+            for t in _closed:
+                underlying_move=None
+                if t.underlying_entry and t.underlying_exit:
+                    underlying_move=(float(t.underlying_exit)/float(t.underlying_entry)-1)*100
+                thesis_correct=None
+                if underlying_move is not None:
+                    thesis_correct=(underlying_move>0) if t.direction=="BULLISH" else (underlying_move<0)
+                pnl=float(t.realized_pnl or 0)
+                if thesis_correct is True and pnl>0: diagnosis="MODEL + STRUCTURE WORKED"
+                elif thesis_correct is True and pnl<=0: diagnosis="STRUCTURE / EXECUTION ERROR"
+                elif thesis_correct is False and pnl<=0: diagnosis="DIRECTIONAL THESIS ERROR"
+                elif thesis_correct is False and pnl>0: diagnosis="P&L POSITIVE DESPITE THESIS"
+                else: diagnosis="NEEDS UNDERLYING EXIT"
+                review_rows.append({"ID":t.id,"Ticker":t.ticker,"Strategy":t.strategy,"Underlying Move %":underlying_move,"P&L":pnl,"ROR %":t.return_on_risk_pct,"Diagnosis":diagnosis,"Exit Reason":t.exit_reason})
+            rdf=pd.DataFrame(review_rows)
+            st.dataframe(rdf,use_container_width=True,hide_index=True,column_config={"Underlying Move %":st.column_config.NumberColumn(format="%+.1f%%"),"P&L":st.column_config.NumberColumn(format="$%.2f"),"ROR %":st.column_config.NumberColumn(format="%+.1f%%")})
+            diag=rdf.groupby('Diagnosis').agg(Trades=('ID','size'),Net_PnL=('P&L','sum')).reset_index()
+            st.dataframe(diag,use_container_width=True,hide_index=True,column_config={"Net_PnL":st.column_config.NumberColumn("Net P&L",format="$%.2f")})
+
+    with tab_risk:
+        st.subheader("Portfolio Risk")
+        st.caption("Risk and concentration from open journal positions. Greeks require live option marking/contract Greeks and are intentionally not estimated here.")
+        if not _open:
+            st.info("No open positions to analyze.")
+        else:
+            risk_rows=[]
+            total_risk=0.0
+            for t in _open:
+                risk=float(t.planned_max_loss or 0)
+                if risk<=0 and t.entry_type=="DEBIT": risk=float(t.entry_value or 0)*float(t.quantity or 1)*float(t.multiplier or 1)
+                total_risk+=risk
+                signed=risk if t.direction=="BULLISH" else -risk
+                risk_rows.append({"Ticker":t.ticker,"Strategy":t.strategy,"Direction":t.direction,"Risk $":risk,"Signed Risk $":signed,"Regime":t.regime_label or 'Unknown'})
+            rr=pd.DataFrame(risk_rows)
+            by=rr.groupby('Ticker').agg(Positions=('Ticker','size'),Risk=('Risk $','sum'),Net_Directional_Risk=('Signed Risk $','sum')).reset_index().sort_values('Risk',ascending=False)
+            by['Share %']=by['Risk']/total_risk*100 if total_risk else 0
+            p1,p2,p3=st.columns(3); p1.metric("Capital at Risk",f"${total_risk:,.0f}"); p2.metric("Open Positions",len(_open)); p3.metric("Largest Ticker",f"{by.iloc[0]['Ticker']} · {by.iloc[0]['Share %']:.0f}%" if not by.empty else '—')
+            st.dataframe(by,use_container_width=True,hide_index=True,column_config={"Risk":st.column_config.NumberColumn("Risk $",format="$%.0f"),"Net_Directional_Risk":st.column_config.NumberColumn("Directional $",format="$%+.0f"),"Share %":st.column_config.ProgressColumn(min_value=0,max_value=100,format="%.0f%%")})
+            if not by.empty and by.iloc[0]['Share %']>=35: st.warning(f"Concentration: {by.iloc[0]['Ticker']} represents {by.iloc[0]['Share %']:.0f}% of recorded open risk.")
+            bull=rr.loc[rr['Signed Risk $']>0,'Risk $'].sum(); bear=rr.loc[rr['Signed Risk $']<0,'Risk $'].sum()
+            st.caption(f"Bullish risk ${bull:,.0f} · Bearish risk ${bear:,.0f}. Add live Greeks later for true delta/gamma/theta/vega aggregation.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
