@@ -1,4028 +1,757 @@
-"""
-dashboard/app.py
-MktScan Streamlit dashboard.
-Run: streamlit run dashboard/app.py
+"""MktScan Decision Terminal v2.
+
+A compact four-area Streamlit interface inspired by professional trading terminals:
+TODAY -> RESEARCH -> PORTFOLIO -> VALIDATION.
+
+The UI intentionally prioritizes conclusions and drill-down over dense raw tables.
 """
 from __future__ import annotations
-import calendar
+
 import json
-import sys
 import os
-from datetime import date, datetime, timedelta
+import sys
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
-import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+from sqlalchemy import desc, func, select
 
-# Make mktscan importable from dashboard dir
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from mktscan.config import load_config
 from mktscan.database import (
-    init_db, get_session, get_basket, get_latest_scores,
-    get_score_history, get_recent_articles,
-    SentimentScore, PriceSnapshot, EarningsEvent, ScraperRun,
-    Article, Company, MarketRegimeSnapshot, seed_default_basket, upsert_company
+    Article,
+    Company,
+    EarningsEvent,
+    MarketRegimeSnapshot,
+    MacroEvent,
+    OptionsMarketSnapshot,
+    PriceSnapshot,
+    ScraperRun,
+    TradeJournalEntry,
+    TradeabilityOutcome,
+    get_basket,
+    get_session,
+    init_db,
+    seed_default_basket,
 )
-from sqlalchemy import select, desc, func
-from mktscan.tradeability import (
-    compute_basket_tradeability, DEFAULT_WEIGHTS,
-    tradeability_label, tradeability_color,
-)
-from mktscan.options import generate_basket_setups, DISCLAIMER
-from mktscan.feedback import get_basket_accuracy_stats
+from mktscan.options import DISCLAIMER, generate_basket_setups
+from mktscan.options_interpretation import interpret_options_market
+from mktscan.terminal import iv_state, semantic_signal, setup_quality
+from mktscan.trade_journal import close_trade, create_trade, mark_trade, trade_metrics
 
+st.set_page_config(page_title="MktScan", page_icon="◈", layout="wide", initial_sidebar_state="expanded")
 
-# ── Page config ────────────────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="MktScan",
-    page_icon="📡",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-# ── Custom CSS ─────────────────────────────────────────────────────────────────
-st.markdown("""
+# ─────────────────────────────────────────────────────────────────────────────
+# Trading-terminal visual system
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown(
+    """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;600&display=swap');
-
-html, body, [class*="css"] {
-    font-family: 'IBM Plex Sans', sans-serif;
+:root {
+  --bg: #0d0f14;
+  --panel: #131722;
+  --panel2: #171b26;
+  --border: #2a2e39;
+  --text: #d1d4dc;
+  --muted: #787b86;
+  --blue: #2962ff;
+  --green: #26a69a;
+  --red: #ef5350;
+  --amber: #f2b84b;
 }
-.metric-card {
-    background: rgba(255,255,255,0.03);
-    border: 1px solid rgba(255,255,255,0.08);
-    border-radius: 8px;
-    padding: 16px 20px;
-    margin-bottom: 8px;
-}
-.ticker-label {
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 18px;
-    font-weight: 600;
-    color: #22d3a0;
-}
-.score-badge {
-    font-family: 'IBM Plex Mono', monospace;
-    font-weight: 600;
-}
-.stDataFrame { font-family: 'IBM Plex Mono', monospace; font-size: 12px; }
-div[data-testid="stMetricValue"] { font-family: 'IBM Plex Mono', monospace; }
+html, body, [data-testid="stAppViewContainer"] { background: var(--bg); color: var(--text); }
+[data-testid="stHeader"] { background: rgba(13,15,20,.88); }
+[data-testid="stSidebar"] { background: #10131a; border-right: 1px solid var(--border); }
+.block-container { padding-top: 1.1rem; max-width: 1600px; }
+h1,h2,h3,h4 { letter-spacing: -.02em; }
+hr { border-color: var(--border) !important; }
+.tv-card { background: var(--panel); border: 1px solid var(--border); border-radius: 7px; padding: 14px 16px; }
+.tv-kicker { color: var(--muted); font-size: .72rem; text-transform: uppercase; letter-spacing: .09em; }
+.tv-value { font-size: 1.18rem; font-weight: 650; margin-top: .15rem; }
+.tv-small { color: var(--muted); font-size: .82rem; }
+.tv-title { font-size: 1.05rem; font-weight: 650; }
+.tv-bull { color: var(--green); }
+.tv-bear { color: var(--red); }
+.tv-warn { color: var(--amber); }
+.tv-blue { color: #6e9bff; }
+.tv-pill { display:inline-block; padding:2px 7px; margin-right:4px; border-radius:4px; background:#1f2430; border:1px solid #303746; font-size:.76rem; }
+.tv-section { margin-top: .35rem; margin-bottom: .7rem; color:#9aa0ad; font-size:.78rem; font-weight:650; letter-spacing:.08em; text-transform:uppercase; }
+[data-testid="stMetric"] { background:var(--panel); border:1px solid var(--border); border-radius:7px; padding:10px 12px; }
+[data-testid="stMetricLabel"] { color:var(--muted); }
+[data-testid="stDataFrame"] { border: 1px solid var(--border); border-radius:7px; overflow:hidden; }
+.stButton > button { border-radius:5px; border:1px solid #3a4050; }
+.stButton > button[kind="primary"] { background:var(--blue); border-color:var(--blue); }
+div[data-baseweb="select"] > div { background:#151923; border-color:#343a46; }
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
 
-# ── Init DB ────────────────────────────────────────────────────────────────────
 @st.cache_resource
-def setup():
+def setup_app():
     try:
         load_config()
     except FileNotFoundError:
-        pass  # OK — dashboard can still show existing data
+        pass
     init_db()
-    session = get_session()
-    seed_default_basket(session)
-    session.close()
-
-setup()
-
-
-# ── Cached expensive paths ─────────────────────────────────────────────────────
-# These two calls dominate page load: compute_basket_tradeability issues one
-# yfinance download per ticker, and generate_basket_setups fetches an option
-# chain per ticker. Neither was cached, and the weight sliders live on the same
-# page — so *every slider drag* triggered ~40 network round trips and a full
-# rescore. Streamlit reruns the whole script on any widget change, so caching
-# here is what makes the page usable.
-
-@st.cache_data(ttl=600, show_spinner=False)
-def cached_tradeability(weights: dict | None = None) -> dict:
-    """Basket tradeability. Cache key includes the weights, so moving a slider
-    recomputes the score but reuses the underlying price/IV data pulled below."""
-    session = get_session()
+    s = get_session()
     try:
-        return compute_basket_tradeability(session, weights=weights)
+        seed_default_basket(s)
     finally:
-        session.close()
+        s.close()
 
 
-@st.cache_data(ttl=600, show_spinner=False)
-def cached_setups(_results_key: str, results: dict) -> dict:
-    """
-    Priced option setups. Keyed on a digest of the tradeability scores rather
-    than the full result dict, since only the score and strategy inputs affect
-    the setup.
-    """
-    from mktscan.options import generate_basket_setups
-    return generate_basket_setups(results)
+setup_app()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Data access: cheap database paths first, network paths only on demand
+# ─────────────────────────────────────────────────────────────────────────────
+@st.cache_data(ttl=60, show_spinner=False)
+def basket_tickers() -> list[str]:
+    s = get_session()
+    try:
+        return [c.ticker for c in get_basket(s)]
+    finally:
+        s.close()
 
 
-def results_digest(results: dict) -> str:
-    """Stable cache key from the scores that actually drive setup selection."""
-    import hashlib
-    payload = "|".join(
-        f"{t}:{r.get('score'):.4f}:{r.get('iv_rank')}:{r.get('days_to_earnings')}"
-        for t, r in sorted(results.items())
-    )
-    return hashlib.sha1(payload.encode()).hexdigest()
+@st.cache_data(ttl=60, show_spinner=False)
+def latest_regime():
+    s = get_session()
+    try:
+        return s.execute(select(MarketRegimeSnapshot).order_by(desc(MarketRegimeSnapshot.snapped_at)).limit(1)).scalar_one_or_none()
+    finally:
+        s.close()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def latest_signal_rows() -> dict[str, TradeabilityOutcome]:
+    """Latest persisted signal per ticker. Keeps Today DB-only and fast."""
+    s = get_session()
+    try:
+        rows = s.execute(select(TradeabilityOutcome).order_by(TradeabilityOutcome.ticker, desc(TradeabilityOutcome.predicted_at))).scalars().all()
+        out = {}
+        for r in rows:
+            out.setdefault(r.ticker, r)
+        return out
+    finally:
+        s.close()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def latest_price_rows() -> dict[str, PriceSnapshot]:
+    s = get_session()
+    try:
+        rows = s.execute(select(PriceSnapshot).order_by(PriceSnapshot.ticker, desc(PriceSnapshot.snapped_at))).scalars().all()
+        out = {}
+        for r in rows:
+            out.setdefault(r.ticker, r)
+        return out
+    finally:
+        s.close()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def latest_options_rows() -> dict[str, OptionsMarketSnapshot]:
+    s = get_session()
+    try:
+        rows = s.execute(select(OptionsMarketSnapshot).order_by(OptionsMarketSnapshot.ticker, desc(OptionsMarketSnapshot.snapped_at))).scalars().all()
+        out = {}
+        for r in rows:
+            out.setdefault(r.ticker, r)
+        return out
+    finally:
+        s.close()
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def cached_market_regime():
-    """Latest persisted regime snapshot. No network calls on dashboard reruns."""
-    session = get_session()
+def upcoming_earnings() -> dict[str, EarningsEvent]:
+    s = get_session()
     try:
-        return session.execute(
-            select(MarketRegimeSnapshot)
-            .order_by(desc(MarketRegimeSnapshot.snapped_at))
-            .limit(1)
-        ).scalar_one_or_none()
+        now = datetime.utcnow()
+        rows = s.execute(
+            select(EarningsEvent)
+            .where(EarningsEvent.report_date >= now)
+            .order_by(EarningsEvent.report_date)
+        ).scalars().all()
+        out = {}
+        for r in rows:
+            out.setdefault(r.ticker, r)
+        return out
     finally:
-        session.close()
+        s.close()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def next_macro_event():
+    s = get_session()
+    try:
+        now = datetime.utcnow()
+        return s.execute(select(MacroEvent).where(MacroEvent.event_at >= now).order_by(MacroEvent.event_at).limit(1)).scalar_one_or_none()
+    finally:
+        s.close()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def data_freshness() -> dict[str, datetime | None]:
+    s = get_session()
+    try:
+        def mx(model, col):
+            return s.execute(select(func.max(col))).scalar_one_or_none()
+        return {
+            "price": mx(PriceSnapshot, PriceSnapshot.snapped_at),
+            "signal": mx(TradeabilityOutcome, TradeabilityOutcome.predicted_at),
+            "options": mx(OptionsMarketSnapshot, OptionsMarketSnapshot.snapped_at),
+            "regime": mx(MarketRegimeSnapshot, MarketRegimeSnapshot.snapped_at),
+            "news": mx(Article, Article.scraped_at),
+            "run": mx(ScraperRun, ScraperRun.finished_at),
+        }
+    finally:
+        s.close()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def technical_opportunity(ticker: str):
+    from mktscan.terminal import technical_opportunity as _tech
+    return _tech(ticker)
 
 
 @st.cache_data(ttl=15, show_spinner=False)
-def cached_live_quote(ticker: str, feed: str, refresh_nonce: int = 0):
-    """Alpaca stock snapshot. The nonce lets the Refresh button bypass TTL."""
+def live_quote(ticker: str, feed: str, nonce: int = 0):
     from mktscan.providers.alpaca import AlpacaMarketDataClient
     return AlpacaMarketDataClient(feed=feed).get_quote(ticker)
 
 
 @st.cache_data(ttl=15, show_spinner=False)
-def cached_live_bars(ticker: str, range_label: str, feed: str, refresh_nonce: int = 0) -> pd.DataFrame:
-    """Chart bars from Alpaca with a short cache for Streamlit reruns."""
+def live_bars(ticker: str, range_label: str, feed: str, nonce: int = 0) -> pd.DataFrame:
     from mktscan.live_charts import chart_window, prepare_chart_bars
     from mktscan.providers.alpaca import AlpacaMarketDataClient
     cfg, start, end = chart_window(range_label)
-    raw = AlpacaMarketDataClient(feed=feed).get_bars(
-        ticker, timeframe=cfg.timeframe, start=start, end=end, limit=cfg.max_bars
-    )
+    raw = AlpacaMarketDataClient(feed=feed).get_bars(ticker, timeframe=cfg.timeframe, start=start, end=end, limit=cfg.max_bars)
     return prepare_chart_bars(raw, range_label)
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def cached_daily_bars(ticker: str, feed: str, refresh_nonce: int = 0) -> pd.DataFrame:
-    """Daily bars used only for the current-session RVOL baseline."""
-    from datetime import timezone
-    from mktscan.providers.alpaca import AlpacaMarketDataClient
-    end = datetime.now(timezone.utc)
-    start = end - timedelta(days=45)
-    return AlpacaMarketDataClient(feed=feed).get_bars(
-        ticker, timeframe="1Day", start=start, end=end, limit=60
-    )
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def cached_sidebar_stats() -> dict:
-    """Sidebar counters. These ran a COUNT(*) over articles on every rerun of
-    every page, including page switches that do not use them."""
-    session = get_session()
+@st.cache_data(ttl=600, show_spinner=False)
+def live_tradeability() -> dict:
+    from mktscan.tradeability import compute_basket_tradeability
+    s = get_session()
     try:
-        latest_run = session.execute(
-            select(ScraperRun).order_by(desc(ScraperRun.started_at)).limit(1)
-        ).scalar_one_or_none()
-        return {
-            "companies": len(get_basket(session)),
-            "articles": session.execute(select(func.count(Article.id))).scalar() or 0,
-            "last_run_at": latest_run.started_at if latest_run else None,
-            "last_run_status": latest_run.status if latest_run else None,
-        }
+        return compute_basket_tradeability(s)
     finally:
-        session.close()
+        s.close()
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def cached_technical_opportunity(ticker: str):
-    from mktscan.terminal import technical_opportunity
-    return technical_opportunity(ticker)
+@st.cache_data(ttl=120, show_spinner=False)
+def change_feed(limit: int = 12) -> list[dict]:
+    """Compact 'what changed' feed using persisted signals/options/regime."""
+    s = get_session()
+    events: list[dict] = []
+    try:
+        tickers = [c.ticker for c in get_basket(s)]
+        for tk in tickers:
+            sigs = s.execute(select(TradeabilityOutcome).where(TradeabilityOutcome.ticker == tk).order_by(desc(TradeabilityOutcome.predicted_at)).limit(2)).scalars().all()
+            if len(sigs) == 2:
+                a, b = sigs[0], sigs[1]
+                if a.label_at_prediction != b.label_at_prediction:
+                    events.append({"at": a.predicted_at, "ticker": tk, "text": f"Signal {b.label_at_prediction} → {a.label_at_prediction}", "kind": "signal"})
+                elif abs(float(a.score_at_prediction) - float(b.score_at_prediction)) >= .15:
+                    events.append({"at": a.predicted_at, "ticker": tk, "text": f"Signal moved {b.score_at_prediction:+.2f} → {a.score_at_prediction:+.2f}", "kind": "signal"})
+            opts = s.execute(select(OptionsMarketSnapshot).where(OptionsMarketSnapshot.ticker == tk).order_by(desc(OptionsMarketSnapshot.snapped_at)).limit(2)).scalars().all()
+            if len(opts) == 2 and opts[0].iv_percentile_1y is not None and opts[1].iv_percentile_1y is not None:
+                delta = float(opts[0].iv_percentile_1y) - float(opts[1].iv_percentile_1y)
+                if abs(delta) >= 15:
+                    events.append({"at": opts[0].snapped_at, "ticker": tk, "text": f"IV percentile {opts[1].iv_percentile_1y:.0f} → {opts[0].iv_percentile_1y:.0f}", "kind": "iv"})
+        regs = s.execute(select(MarketRegimeSnapshot).order_by(desc(MarketRegimeSnapshot.snapped_at)).limit(2)).scalars().all()
+        if len(regs) == 2 and regs[0].regime_label != regs[1].regime_label:
+            events.append({"at": regs[0].snapped_at, "ticker": "MARKET", "text": f"Regime {regs[1].regime_label} → {regs[0].regime_label}", "kind": "market"})
+    finally:
+        s.close()
+    events.sort(key=lambda x: x["at"] or datetime.min, reverse=True)
+    return events[:limit]
 
-# ── Navigation callbacks ───────────────────────────────────────────────────────
-def _navigate(page_name: str, ticker: str | None = None):
-    """Update widget-backed navigation state safely from a Streamlit callback.
 
-    Streamlit forbids mutating a session-state key after the widget that owns
-    that key has been instantiated in the current run. Button callbacks execute
-    before the next script rerun, so this is the supported way to change both
-    the global ticker selectbox and the navigation radio from page content.
-    """
+def age_text(ts: datetime | None) -> str:
+    if not ts:
+        return "unavailable"
+    now = datetime.utcnow()
+    if ts.tzinfo is not None:
+        now = datetime.now(timezone.utc)
+    sec = max(0, (now - ts).total_seconds())
+    if sec < 90: return f"{int(sec)}s ago"
+    if sec < 3600: return f"{int(sec/60)}m ago"
+    if sec < 86400: return f"{sec/3600:.1f}h ago"
+    return f"{sec/86400:.1f}d ago"
+
+
+def signal_color(label: str) -> str:
+    u = str(label).upper()
+    if "BULL" in u or "RISK_ON" in u: return "tv-bull"
+    if "BEAR" in u or "RISK_OFF" in u: return "tv-bear"
+    return ""
+
+
+def card(label: str, value: str, sub: str = "", cls: str = ""):
+    st.markdown(f'<div class="tv-card"><div class="tv-kicker">{label}</div><div class="tv-value {cls}">{value}</div><div class="tv-small">{sub}</div></div>', unsafe_allow_html=True)
+
+
+def nav_to(area: str, ticker: str | None = None, section: str | None = None):
+    """Safe Streamlit navigation callback. Called via on_click before rerun."""
     if ticker:
         st.session_state["global_ticker"] = ticker
-    st.session_state["main_navigation"] = page_name
+    st.session_state["area"] = area
+    if section:
+        st.session_state["research_section"] = section
 
 
-def _open_journal_from_workspace(ticker: str, strategy: str = ""):
+def nav_to_journal(ticker: str, strategy: str = ""):
     st.session_state["journal_prefill_ticker"] = ticker
     st.session_state["journal_prefill_strategy"] = strategy
-    _navigate("Trade Journal", ticker)
+    st.session_state["portfolio_view"] = "Journal"
+    nav_to("Portfolio", ticker)
 
 
-# ── Sidebar ────────────────────────────────────────────────────────────────────
+def _event_days(row: EarningsEvent | None) -> int | None:
+    if not row or not row.report_date:
+        return None
+    return max(0, (row.report_date.date() - date.today()).days)
+
+
+def build_decision(ticker: str, sig, regime, tech, opt, earn) -> dict:
+    score = float(sig.score_at_prediction) if sig else None
+    coverage = 0.75 if sig else 0.0  # persisted outcomes currently do not store coverage
+    ivpct = float(opt.iv_percentile_1y) if opt and opt.iv_percentile_1y is not None else None
+    quality = setup_quality(score, coverage, regime.regime_label if regime else None, tech, ivpct, _event_days(earn))
+    options_view = interpret_options_market(opt, score, sig.label_at_prediction if sig else None) if opt else None
+    risks = list(quality["risks"])
+    if opt and opt.term_state == "BACKWARDATION": risks.append("Near-term IV is elevated")
+    status = "READY" if quality["label"] == "HIGH" and not any("risk in" in r.lower() for r in risks) else "WATCH" if quality["label"] != "LOW" else "AVOID"
+    return {"quality": quality, "options": options_view, "status": status, "score": score, "risks": risks[:4]}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Global context + four-area navigation
+# ─────────────────────────────────────────────────────────────────────────────
+tickers = basket_tickers()
+if not tickers:
+    st.error("No basket tickers are configured.")
+    st.stop()
+if st.session_state.get("global_ticker") not in tickers:
+    st.session_state["global_ticker"] = tickers[0]
+if st.session_state.get("area") not in {"Today", "Research", "Portfolio", "Validation"}:
+    st.session_state["area"] = "Today"
+
 with st.sidebar:
-    st.markdown("## 📡 MktScan")
-    st.caption("Market Intelligence Terminal")
+    st.markdown("### ◈ MktScan")
+    st.caption("Decision Terminal")
+    st.selectbox("Ticker", tickers, key="global_ticker")
+    st.radio("", ["Today", "Research", "Portfolio", "Validation"], key="area", label_visibility="collapsed")
     st.divider()
-
-    page = st.radio(
-        "Navigation",
-        ["Today", "Workspace", "Dashboard", "Tradeability", "Live Charts", "Options Market", "Trade Journal", "News Feed", "Earnings", "Economic Calendar", "Basket", "Backtest", "Data Definitions", "Run Scraper"],
-        label_visibility="collapsed",
-        key="main_navigation",
-    )
-
-    # Global ticker context shared by Today/Workspace and used as the default elsewhere.
-    _ctx_session = get_session()
-    _ctx_tickers = [c.ticker for c in get_basket(_ctx_session)]
-    _ctx_session.close()
-    if _ctx_tickers:
-        if st.session_state.get("global_ticker") not in _ctx_tickers:
-            st.session_state["global_ticker"] = _ctx_tickers[0]
-        st.selectbox("Global ticker", _ctx_tickers, key="global_ticker", help="Shared ticker context for the decision workflow.")
-
-    st.divider()
-
-    # Quick stats (cached — see cached_sidebar_stats)
-    stats = cached_sidebar_stats()
-
-    st.metric("Companies", stats["companies"])
-    st.metric("Total Articles", f"{stats['articles']:,}")
-    if stats["last_run_at"]:
-        elapsed = (datetime.utcnow() - stats["last_run_at"]).total_seconds() / 3600
-        st.metric("Last Run", f"{elapsed:.1f}h ago")
-        st.caption(f"Status: {stats['last_run_status']}")
-    else:
-        st.metric("Last Run", "Never")
-
-    if st.button("↻ Refresh data", use_container_width=True):
-        st.cache_data.clear()
-        st.rerun()
-
-    st.divider()
-    st.caption("v2.0.0 · MktScan")
-
-
-# ── Helper functions ───────────────────────────────────────────────────────────
-class _AdhocPriceError(Exception):
-    """
-    Raised when an ad-hoc ticker has no retrievable price.
-
-    A plain ``st.stop()`` cannot be used inside the ad-hoc analysis block: it
-    raises Streamlit's StopException, which the surrounding broad
-    ``except Exception`` catches, replacing the specific "check the ticker
-    symbol" message with a generic failure. A dedicated exception caught ahead
-    of the broad handler preserves the message.
-    """
-    def __init__(self, ticker: str):
-        self.ticker = ticker
-        super().__init__(f"No price for {ticker}")
-
-
-def format_component_value(value) -> str:
-    """
-    Render a signal component for display, whatever its type.
-
-    Component dicts are deliberately heterogeneous — they carry the signed
-    sub-scores that drive the composite, but also context the user needs to
-    interpret them: `iv_basis` is a string ("chain" / "proxy" / "none"),
-    `mean_reversion_flag` is a bool, `earnings_days_away` is a count, and
-    `iv_percentile` is None until IV history exists.
-
-    Formatting them all with `:+.3f` crashes on the first string
-    (`ValueError: Unknown format code 'f' for object of type 'str'`) and on the
-    first None. Signed decimals are reserved for the actual float sub-scores,
-    where the sign carries meaning.
-    """
-    if value is None:
-        return "—"
-    if isinstance(value, bool):            # check before int — bool subclasses int
-        return "yes" if value else "no"
-    if isinstance(value, int):
-        # Plain integers — these are counts (days to earnings, history days,
-        # streak length), not signed scores, so a leading "+" would misread as
-        # bullishness. Negatives still print their minus sign naturally.
-        return str(value)
-    if isinstance(value, float):
-        # Only the float sub-scores get an explicit sign, where it means direction.
-        return f"{value:+.3f}"
-    return str(value)
-
-
-def sentiment_color(score: float) -> str:
-    if score > 0.3:  return "#22d3a0"
-    if score < -0.1: return "#f87171"
-    return "#fbbf24"
-
-def sentiment_emoji(label: str) -> str:
-    return {"BULLISH": "🟢", "BEARISH": "🔴", "NEUTRAL": "🟡"}.get(label, "⚪")
-
-def score_bar_html(score: float, width: int = 120) -> str:
-    pct  = abs(score) * 100
-    col  = sentiment_color(score)
-    sign = "+" if score >= 0 else ""
-    return (
-        f'<span style="font-family:\'IBM Plex Mono\',monospace;color:{col};font-weight:600">'
-        f'{sign}{score:.3f}</span>'
-        f'<div style="background:rgba(255,255,255,0.05);border-radius:2px;height:4px;'
-        f'width:{width}px;margin-top:3px;overflow:hidden">'
-        f'<div style="width:{pct:.0f}%;height:100%;background:{col};border-radius:2px"></div>'
-        f'</div>'
-    )
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# DASHBOARD PAGE
-# ═══════════════════════════════════════════════════════════════════════════════
-if page == "Today":
-    st.title("Today")
-    st.caption("Decision-first view: market context, portfolio state, and the basket names that deserve attention.")
-    from mktscan.database import OptionsMarketSnapshot, TradeabilityOutcome, TradeJournalEntry
-    from mktscan.terminal import semantic_signal, iv_state, setup_quality
-    from mktscan.trade_journal import trade_metrics
-    _s=get_session(); _reg=cached_market_regime(); _basket=get_basket(_s)
-    _open=_s.execute(select(TradeJournalEntry).where(TradeJournalEntry.status=="OPEN")).scalars().all()
-    _closed=_s.execute(select(TradeJournalEntry).where(TradeJournalEntry.status=="CLOSED")).scalars().all()
-    _open_pnl=sum((trade_metrics(t, use_current=True).pnl or 0) for t in _open)
-    _risk=sum(float(t.planned_max_loss or 0) for t in _open)
-    _next_event=_reg.next_macro_event if _reg else None
-    h1,h2,h3,h4,h5,h6=st.columns(6)
-    h1.metric("Market", (_reg.regime_label or "UNKNOWN").replace("_"," ") if _reg else "UNKNOWN")
-    h2.metric("VIX", f"{_reg.vix:.1f}" if _reg and _reg.vix is not None else "—", (_reg.volatility_state or "").replace("_"," ") if _reg else None)
-    h3.metric("Open P&L", f"${_open_pnl:,.0f}")
-    h4.metric("Capital at Risk", f"${_risk:,.0f}")
-    h5.metric("Positions", len(_open))
-    h6.metric("Next Event", _next_event or "None", f"{_reg.hours_to_macro:.0f}h" if _reg and _reg.hours_to_macro is not None else None)
-    st.divider()
-    with st.spinner("Ranking basket opportunities…"):
-        _results=cached_tradeability()
-    _opts={r.ticker:r for r in _s.execute(select(OptionsMarketSnapshot).order_by(OptionsMarketSnapshot.snapshot_date.desc())).scalars().all() if r.ticker not in locals().get('_seen',set())}
-    rows=[]
-    for c in _basket:
-        r=_results.get(c.ticker) or {}; om=_opts.get(c.ticker); score=r.get('score'); cov=r.get('coverage')
-        q=setup_quality(score,cov,_reg.regime_label if _reg else None,None,om.iv_percentile_1y if om else None,r.get('days_to_earnings'))
-        rows.append({"Ticker":c.ticker,"Setup":q['label'],"Signal":semantic_signal(score),"Score":score,"Confidence":cov,"IV":iv_state(om.iv_percentile_1y if om else None),"Regime":(_reg.regime_label or 'UNKNOWN').replace('_',' ') if _reg else 'UNKNOWN',"Event":f"E {r.get('days_to_earnings')}d" if r.get('days_to_earnings') is not None and r.get('days_to_earnings')<=14 else "—","Quality":q['score']})
-    _s.close(); df=pd.DataFrame(rows).sort_values(["Quality","Score"],ascending=[False,False])
-    f1,f2=st.columns([1,3]); minq=f1.select_slider("Minimum setup",options=["ALL","LOW","MODERATE","HIGH"],value="MODERATE")
-    if minq!="ALL":
-        order={"LOW":1,"MODERATE":2,"HIGH":3}; df=df[df['Setup'].map(order)>=order[minq]]
-    st.subheader("Opportunities")
-    st.dataframe(df[["Ticker","Setup","Signal","Score","Confidence","IV","Regime","Event"]],use_container_width=True,hide_index=True,column_config={"Score":st.column_config.NumberColumn(format="%+.3f"),"Confidence":st.column_config.ProgressColumn(min_value=0,max_value=1,format="%.0%%")})
-    pick=st.selectbox("Review ticker",df['Ticker'].tolist() if not df.empty else [st.session_state.get('global_ticker')],key='today_pick')
-    st.button(
-        "Open Workspace",
-        type="primary",
-        on_click=_navigate,
-        args=("Workspace", pick),
-    )
-
-elif page == "Workspace":
-    ticker=st.session_state.get('global_ticker')
-    st.title(f"{ticker} Workspace")
-    st.caption("One ticker, one workflow: signal → technical confirmation → options context → trade construction.")
-    from mktscan.terminal import setup_quality, semantic_signal, iv_state
-    from mktscan.options_market import latest_options_market
-    from mktscan.options_interpretation import interpret_options_market
-    _s=get_session(); _results=cached_tradeability(); r=_results.get(ticker,{})
-    om=latest_options_market(_s,ticker); reg=cached_market_regime()
-    with st.spinner("Loading technical opportunity…"):
-        tech=cached_technical_opportunity(ticker)
-    q=setup_quality(r.get('score'),r.get('coverage'),reg.regime_label if reg else None,tech,om.iv_percentile_1y if om else None,r.get('days_to_earnings'))
-    a,b,c,d,e=st.columns(5)
-    a.metric("Setup Quality",q['label'],f"{q['score']}/100")
-    b.metric("Signal",semantic_signal(r.get('score')),f"{r.get('score',0):+.3f}")
-    c.metric("Confidence",f"{(r.get('coverage') or 0):.0%}")
-    d.metric("Market",(reg.regime_label or 'UNKNOWN').replace('_',' ') if reg else 'UNKNOWN')
-    e.metric("IV",iv_state(om.iv_percentile_1y if om else None),f"{om.iv_percentile_1y:.0f} pct" if om and om.iv_percentile_1y is not None else '—')
-    if q['strengths']: st.success("Strengths: " + " · ".join(q['strengths']))
-    if q['risks']: st.warning("Risks: " + " · ".join(q['risks']))
-    t1,t2,t3,t4=st.columns(4)
-    t1.metric("Trend",tech.trend_state); t2.metric("Momentum",tech.momentum_state); t3.metric("Relative Strength",tech.relative_strength_state); t4.metric("Volume",tech.volume_state, f"RVOL {tech.rvol20:.2f}×" if tech.rvol20 else None)
-    with st.expander("Technical details",expanded=False):
-        st.write({"RSI 14":tech.rsi14,"ADX 14":tech.adx14,"5d return %":tech.return_5d,"20d return %":tech.return_20d,"20d vs SPY %":tech.rs_spy_20d,"20d vs QQQ %":tech.rs_qqq_20d,"Momentum acceleration":tech.momentum_acceleration})
-    st.subheader("Live Price")
-    if os.getenv("ALPACA_API_KEY") or os.getenv("APCA_API_KEY_ID"):
-        try:
-            from mktscan.providers.alpaca import AlpacaMarketDataClient
-            from mktscan.live_charts import chart_window, prepare_chart_bars
-            _client=AlpacaMarketDataClient(); _cfg,_start,_end=chart_window("1D")
-            _bars=prepare_chart_bars(_client.get_bars(ticker, timeframe=_cfg.timeframe, start=_start, end=_end, limit=_cfg.max_bars),"1D")
-            _quote=_client.get_quote(ticker)
-            if not _bars.empty:
-                _x=_bars['market_time']; _fig=go.Figure(go.Candlestick(x=_x,open=_bars['open'],high=_bars['high'],low=_bars['low'],close=_bars['close'],name=ticker))
-                _fig.add_trace(go.Scatter(x=_x,y=_bars['ema_9'],name='EMA 9')); _fig.add_trace(go.Scatter(x=_x,y=_bars['ema_20'],name='EMA 20')); _fig.add_trace(go.Scatter(x=_x,y=_bars['vwap'],name='VWAP'))
-                if om and om.expected_move_dollars and _quote.last:
-                    _fig.add_hline(y=_quote.last+om.expected_move_dollars,line_dash='dot',annotation_text='+ implied move'); _fig.add_hline(y=_quote.last-om.expected_move_dollars,line_dash='dot',annotation_text='- implied move')
-                _fig.update_layout(height=430,xaxis_rangeslider_visible=False,margin=dict(l=10,r=10,t=20,b=10),hovermode='x unified')
-                st.plotly_chart(_fig,use_container_width=True)
-        except Exception as exc: st.caption(f"Live chart unavailable: {exc}")
-    else: st.info("Configure Alpaca credentials to embed the live intraday chart here.")
-    st.subheader("Options Context")
-    if om:
-        interp=interpret_options_market(om,r.get('score'),r.get('label'))
-        o1,o2,o3,o4=st.columns(4); o1.metric("ATM IV",f"{om.atm_iv*100:.1f}%" if om.atm_iv else '—'); o2.metric("IV Percentile",f"{om.iv_percentile_1y:.0f}" if om.iv_percentile_1y is not None else '—'); o3.metric("Term",om.term_state or '—'); o4.metric("Expected Move",f"±{om.expected_move_pct:.1f}%" if om.expected_move_pct is not None else '—')
-        st.info(f"{interp.structure_bias}: {interp.thesis}")
-    else: st.info("No Options Market snapshot yet for this ticker.")
-    st.subheader("Trade Builder")
-    if st.button("Build live option setup",type="primary",key='workspace_build'):
-        with st.spinner("Fetching live chain and constructing trade…"):
-            try: st.session_state['workspace_setup']=generate_basket_setups({ticker:r}).get(ticker)
-            except Exception as exc: st.error(str(exc))
-    setup=st.session_state.get('workspace_setup')
-    if setup and setup.get('ticker')==ticker:
-        if setup.get('tradeable'):
-            b1,b2,b3,b4,b5=st.columns(5); b1.metric("Structure",setup.get('structure','—').replace('_',' ').title()); b2.metric("Cost/Credit",f"${abs(setup.get('cost_per_contract') or 0):,.0f}"); b3.metric("Max Loss",f"${setup.get('max_loss_per_contract'):,.0f}" if setup.get('max_loss_per_contract') is not None else '—'); b4.metric("Max Profit",f"${setup.get('max_profit_per_contract'):,.0f}" if setup.get('max_profit_per_contract') is not None else '—'); b5.metric("Breakeven",f"${setup.get('breakeven'):,.2f}" if setup.get('breakeven') else '—')
-            st.dataframe(pd.DataFrame(setup.get('legs',[])),use_container_width=True,hide_index=True)
-            st.caption(f"Net Δ {setup.get('net_delta','—')} · Θ/day ${setup.get('net_theta_per_day_per_contract','—')} · Vega {setup.get('net_vega_per_contract','—')} · Confidence {setup.get('confidence_tier','—')}")
-            st.button(
-                "Log this trade in Journal",
-                on_click=_open_journal_from_workspace,
-                args=(ticker, setup.get("structure", "")),
-            )
-        else: st.warning(setup.get('reason') or setup.get('error') or 'No tradeable setup.')
-    st.caption("Live chart remains available on the Live Charts page; the global ticker is already synchronized.")
-
-elif page == "Dashboard":
-    st.title("Market Dashboard")
-
-    session = get_session()
-    latest_scores = get_latest_scores(session)
-    companies     = get_basket(session)
-
-    # ── Last run banner + ad-hoc run button ───────────────────────────────────
-    session_kpi = get_session()
-    earnings_count = session_kpi.execute(
-        select(func.count(EarningsEvent.id)).where(
-            EarningsEvent.report_date >= datetime.utcnow(),
-            EarningsEvent.report_date <= datetime.utcnow() + timedelta(days=7),
-        )
-    ).scalar() or 0
-    total_articles = session_kpi.execute(select(func.count(Article.id))).scalar() or 0
-    recent_run = session_kpi.execute(
-        select(ScraperRun).order_by(desc(ScraperRun.started_at)).limit(1)
-    ).scalar_one_or_none()
-
-    # Last 5 runs for the history tooltip
-    recent_runs = session_kpi.execute(
-        select(ScraperRun).order_by(desc(ScraperRun.started_at)).limit(5)
-    ).scalars().all()
-    session_kpi.close()
-
-    # Build banner content
-    if recent_run:
-        run_dt      = recent_run.started_at
-        elapsed_sec = (datetime.utcnow() - run_dt).total_seconds()
-        elapsed_h   = elapsed_sec / 3600
-        if elapsed_sec < 60:
-            elapsed_str = "just now"
-        elif elapsed_sec < 3600:
-            elapsed_str = f"{int(elapsed_sec // 60)} min ago"
-        elif elapsed_h < 24:
-            elapsed_str = f"{elapsed_h:.1f}h ago"
-        else:
-            elapsed_str = f"{elapsed_h / 24:.1f} days ago"
-
-        run_dt_str  = run_dt.strftime("%A %b %d, %Y at %H:%M UTC")
-        status_icon = {"ok": "✅", "error": "❌", "running": "🔄", "partial": "⚠️"}.get(
-            recent_run.status, "❓"
-        )
-        status_color = {
-            "ok": "#22d3a0", "error": "#f87171",
-            "running": "#60a5fa", "partial": "#fbbf24"
-        }.get(recent_run.status, "#94a3b8")
-
-        banner_right = (
-            f'<div style="text-align:right">'
-            f'<div style="font-family:IBM Plex Mono,monospace;font-size:11px;color:#64748b">Last run</div>'
-            f'<div style="font-family:IBM Plex Mono,monospace;font-size:16px;font-weight:600;'
-            f'color:{status_color}">{status_icon} {elapsed_str}</div>'
-            f'<div style="font-size:11px;color:#475569;margin-top:2px">{run_dt_str}</div>'
-            f'<div style="font-size:10px;color:#334155;margin-top:2px">'
-            f'Run #{recent_run.id} · {recent_run.articles_new or 0} new articles · '
-            f'{recent_run.tickers_scored or 0} scored</div>'
-            f'</div>'
-        )
-    else:
-        status_color = "#f87171"
-        banner_right = (
-            '<div style="text-align:right">'
-            '<div style="font-family:IBM Plex Mono,monospace;font-size:16px;'
-            'font-weight:600;color:#f87171">Never run</div>'
-            '<div style="font-size:11px;color:#475569">Click Run Now to fetch data</div>'
-            '</div>'
-        )
-
-    # Banner + run button side by side
-    banner_col, run_col = st.columns([3, 1])
-
-    with banner_col:
-        st.markdown(
-            f'<div style="background:rgba(255,255,255,0.02);border:1px solid {status_color}33;'
-            f'border-radius:8px;padding:12px 18px;display:flex;'
-            f'justify-content:space-between;align-items:center">'
-            f'<div>'
-            f'<div style="font-family:IBM Plex Mono,monospace;font-size:10px;'
-            f'color:#64748b;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:4px">'
-            f'Scraper status</div>'
-            f'<div style="display:flex;gap:16px;flex-wrap:wrap">'
-            + "".join([
-                f'<div style="font-size:11px;color:#475569">'
-                f'<span style="font-family:IBM Plex Mono,monospace;font-size:11px;'
-                f'color:#64748b">Run #{r.id}</span>  '
-                f'{"✅" if r.status=="ok" else "⚠️" if r.status=="partial" else "❌"}  '
-                f'{r.started_at.strftime("%b %d %H:%M")}'
-                f'</div>'
-                for r in recent_runs
-            ])
-            + f'</div></div>'
-            + banner_right
-            + '</div>',
-            unsafe_allow_html=True,
-        )
-
-    with run_col:
-        st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-        run_mode = st.selectbox(
-            "Mode",
-            ["all", "news", "earnings", "prices"],
-            label_visibility="collapsed",
-            key="dash_run_mode",
-        )
-        run_clicked = st.button(
-            "▶ Run Now",
-            type="primary",
-            use_container_width=True,
-            key="dash_run_btn",
-        )
-
-    # ── Ad-hoc run execution ──────────────────────────────────────────────────
-    if run_clicked:
-        from mktscan.engine import ScrapeEngine
-        run_log   = st.empty()
-        log_lines: list[str] = []
-
-        def _dash_log(level: str, msg: str):
-            icons = {"ok": "✅", "warn": "⚠️", "err": "❌", "info": "ℹ️"}
-            ts = datetime.utcnow().strftime("%H:%M:%S")
-            log_lines.append(f"`{ts}` {icons.get(level,'·')}  {msg}")
-            run_log.markdown("\n\n".join(log_lines[-20:]))
-
-        try:
-            cfg = load_config()
-            engine = ScrapeEngine(cfg=cfg, progress_cb=_dash_log)
-            with st.spinner(f"Running scraper ({run_mode} mode)…"):
-                result = engine.run(mode=run_mode)
-            st.success(
-                f"✅ Done — {result['articles_new']} new articles, "
-                f"{result['tickers_scored']} scored in {result['elapsed_seconds']:.0f}s"
-            )
-            if result.get("errors"):
-                with st.expander("Errors", expanded=False):
-                    for e in result["errors"]:
-                        st.error(e)
-            st.rerun()   # refresh dashboard with fresh data
-        except Exception as e:
-            st.error(f"Run failed: {e}")
-
-    # ── Market regime context ───────────────────────────────────────────────
-    regime_row = cached_market_regime()
-    st.markdown("### Market Regime")
-    st.caption(
-        "Context only — this snapshot is recorded for validation and does not "
-        "modify tradeability scores, strategy selection, or sizing."
-    )
-    if regime_row is None:
-        st.info("No regime snapshot yet. Run the scraper in `all`/`prices` mode or `mktscan regime --refresh`.")
-    else:
-        label = (regime_row.regime_label or "UNKNOWN").replace("_", " ")
-        score = regime_row.regime_score
-        conf = regime_row.confidence
-        rg1, rg2, rg3, rg4, rg5, rg6 = st.columns(6)
-        rg1.metric("Regime", label)
-        rg2.metric("Score", f"{score:+.2f}" if score is not None else "—")
-        rg3.metric("Confidence", f"{conf:.0%}" if conf is not None else "—")
-        rg4.metric("VIX", f"{regime_row.vix:.1f}" if regime_row.vix is not None else "—",
-                   regime_row.volatility_state.replace("_", " ") if regime_row.volatility_state else None)
-        rg5.metric("Breadth > 50d", f"{regime_row.breadth_above_50d:.0f}%" if regime_row.breadth_above_50d is not None else "—",
-                   f"{regime_row.breadth_universe_size or 0} basket names")
-        macro_delta = None
-        if regime_row.hours_to_macro is not None:
-            macro_delta = f"in {regime_row.hours_to_macro:.0f}h"
-        rg6.metric("Next high-impact macro", regime_row.next_macro_event or "None", macro_delta)
-
-        with st.expander("Regime components", expanded=False):
-            rows = [
-                {"Component": "SPY trend", "Score": regime_row.spy_trend_score, "Detail": f"20d {regime_row.spy_return_20d:+.1f}%" if regime_row.spy_return_20d is not None else "—"},
-                {"Component": "QQQ trend", "Score": regime_row.qqq_trend_score, "Detail": f"20d {regime_row.qqq_return_20d:+.1f}%" if regime_row.qqq_return_20d is not None else "—"},
-                {"Component": "Volatility", "Score": regime_row.volatility_score, "Detail": regime_row.volatility_state or "—"},
-                {"Component": "Basket breadth", "Score": regime_row.breadth_score, "Detail": f">20d {regime_row.breadth_above_20d:.0f}% · >200d {regime_row.breadth_above_200d:.0f}%" if regime_row.breadth_above_20d is not None and regime_row.breadth_above_200d is not None else "—"},
-                {"Component": "Rates", "Score": regime_row.rates_score, "Detail": f"2Y {regime_row.two_year_yield:.2f}% · 10Y {regime_row.ten_year_yield:.2f}%" if regime_row.two_year_yield is not None and regime_row.ten_year_yield is not None else "—"},
-                {"Component": "Macro risk", "Score": regime_row.macro_risk_score, "Detail": regime_row.next_macro_event or "—"},
-            ]
-            df_regime = pd.DataFrame(rows)
-            df_regime["Score"] = df_regime["Score"].map(lambda x: f"{x:+.2f}" if pd.notna(x) else "—")
-            st.dataframe(df_regime, use_container_width=True, hide_index=True)
-            st.caption(
-                "Regime score weights: trend 45%, basket breadth 25%, volatility 20%, rates 10%. "
-                "Macro is a non-directional caution flag and is not included in the score."
-            )
-
-    st.divider()
-
-    # ── Ad-hoc ticker analysis ───────────────────────────────────────────────
-    with st.expander("🔍  Analyse a specific ticker", expanded=False):
-        st.caption(
-            "Enter any stock ticker for an instant snapshot — price, momentum, "
-            "sentiment, and a trade setup — without adding it to your basket."
-        )
-
-        ac1, ac2, ac3 = st.columns([1, 1, 2])
-        adhoc_ticker = ac1.text_input(
-            "Ticker", placeholder="e.g. TSLA", max_chars=10,
-            key="adhoc_ticker_input",
-        ).upper().strip()
-        adhoc_mode = ac2.selectbox(
-            "Analysis depth",
-            ["Quick (price + momentum)", "Full (all signals + trade setup)"],
-            key="adhoc_mode",
-        )
-        adhoc_go = ac3.button(
-            "▶ Analyse", type="primary", key="adhoc_go_btn",
-            use_container_width=False,
-        )
-
-        if adhoc_go and adhoc_ticker:
-            import yfinance as yf
-            from mktscan.tradeability import (
-                fetch_daily_returns, calc_price_momentum_signal,
-                calc_technical_signal, calc_sentiment_signal,
-                compute_tradeability, tradeability_label, tradeability_color,
-            )
-            from mktscan.options import generate_trade_setup
-
-            with st.spinner(f"Fetching data for {adhoc_ticker}…"):
-                try:
-                    # ── Fetch price data ──────────────────────────────────────
-                    t    = yf.Ticker(adhoc_ticker)
-                    info = t.info or {}
-
-                    price     = info.get("regularMarketPrice") or info.get("currentPrice") or 0
-                    chg_pct   = info.get("regularMarketChangePercent") or 0
-                    hi_52     = info.get("fiftyTwoWeekHigh")
-                    lo_52     = info.get("fiftyTwoWeekLow")
-                    pe        = info.get("trailingPE")
-                    mkt_cap   = info.get("marketCap")
-                    rating    = info.get("recommendationKey", "")
-                    name      = info.get("shortName") or info.get("longName") or adhoc_ticker
-                    sector    = info.get("sector", "—")
-                    volume    = info.get("regularMarketVolume")
-                    avg_vol   = info.get("averageVolume")
-
-                    if not price:
-                        # NOTE: st.stop() raises StopException, which the broad
-                        # `except Exception` wrapping this block used to swallow —
-                        # so the intended "check the ticker symbol" message was
-                        # replaced by a generic analysis-failed error. Raising a
-                        # sentinel and re-raising it past the handler keeps the
-                        # useful message.
-                        raise _AdhocPriceError(adhoc_ticker)
-
-                    # 120 bars so Wilder's RSI converges; it needs ~100+.
-                    daily_returns = fetch_daily_returns(adhoc_ticker, bars=120)
-                    mom_result    = calc_price_momentum_signal(daily_returns)
-
-                    price_data_adhoc = {
-                        "price":         price,
-                        "change_pct":    chg_pct,
-                        "week_52_high":  hi_52,
-                        "week_52_low":   lo_52,
-                        "pe_ratio":      pe,
-                        "analyst_rating":rating,
-                        "market_cap":    mkt_cap,
-                    }
-                    tech_result = calc_technical_signal(price_data_adhoc)
-
-                    # ── Header ────────────────────────────────────────────────
-                    chg_col = "#22d3a0" if chg_pct >= 0 else "#f87171"
-                    st.markdown(
-                        f'<div style="background:rgba(255,255,255,0.03);border:1px solid '
-                        f'rgba(255,255,255,0.08);border-radius:8px;padding:14px 18px;margin-bottom:12px">'
-                        f'<div style="display:flex;justify-content:space-between;align-items:flex-start">'
-                        f'<div>'
-                        f'<div style="font-family:IBM Plex Mono,monospace;font-size:20px;'
-                        f'font-weight:700;color:#22d3a0">{adhoc_ticker}</div>'
-                        f'<div style="font-size:13px;color:#94a3b8;margin-top:2px">{name}</div>'
-                        f'<div style="font-size:11px;color:#475569;margin-top:2px">'
-                        f'{sector} · {"${:,.2f}B mkt cap".format(mkt_cap/1e9) if mkt_cap else "—"}'
-                        f'</div>'
-                        f'</div>'
-                        f'<div style="text-align:right">'
-                        f'<div style="font-family:IBM Plex Mono,monospace;font-size:28px;'
-                        f'font-weight:700;color:#e2e8f0">${price:,.2f}</div>'
-                        f'<div style="font-family:IBM Plex Mono,monospace;font-size:14px;'
-                        f'color:{chg_col}">{chg_pct:+.2f}% today</div>'
-                        f'<div style="font-size:10px;color:#475569;margin-top:2px">'
-                        f'Vol: {"{:,.0f}".format(volume) if volume else "—"} · '
-                        f'Avg: {"{:,.0f}".format(avg_vol) if avg_vol else "—"}'
-                        f'</div>'
-                        f'</div>'
-                        f'</div>'
-                        f'</div>',
-                        unsafe_allow_html=True,
-                    )
-
-                    # ── Key metrics strip ─────────────────────────────────────
-                    m1, m2, m3, m4, m5, m6 = st.columns(6)
-                    m1.metric("Price",       f"${price:,.2f}")
-                    m2.metric("Today",       f"{chg_pct:+.2f}%",
-                              delta=f"{chg_pct:+.2f}%", delta_color="normal")
-                    m3.metric("52w High",    f"${hi_52:,.2f}" if hi_52 else "—")
-                    m4.metric("52w Low",     f"${lo_52:,.2f}" if lo_52 else "—")
-                    m5.metric("P/E",         f"{pe:.1f}" if pe else "—")
-                    m6.metric("Analyst",     rating.title() if rating else "—")
-
-                    st.divider()
-
-                    # ── Momentum metrics ──────────────────────────────────────
-                    rsi      = mom_result.get("rsi")
-                    ann_vol  = mom_result.get("annual_vol")
-                    streak   = mom_result.get("streak", 0)
-                    ret14    = mom_result.get("total_return_14d", 0)
-                    mom_score = mom_result.get("score", 0.0)
-
-                    rsi_col    = "#f87171" if (rsi or 50) > 70 else "#22d3a0" if (rsi or 50) < 30 else "#fbbf24"
-                    streak_col = "#22d3a0" if streak > 0 else "#f87171" if streak < 0 else "#64748b"
-                    ret_col    = "#22d3a0" if ret14 >= 0 else "#f87171"
-                    mom_col    = tradeability_color(mom_score)
-
-                    p1, p2, p3, p4, p5 = st.columns(5)
-                    p1.metric("RSI (14d)",      f"{rsi:.0f}" if rsi else "—",
-                              help="<30 oversold, >70 overbought")
-                    p2.metric("Ann. Volatility", f"{ann_vol:.0f}%" if ann_vol else "—")
-                    p3.metric("Day Streak",      f"{streak:+d} days" if streak else "0 days",
-                              delta=f"{'up' if streak > 0 else 'down' if streak < 0 else 'flat'}",
-                              delta_color="normal" if streak > 0 else "inverse" if streak < 0 else "off")
-                    p4.metric("14d Return",      f"{ret14:+.1f}%",
-                              delta=f"{ret14:+.1f}%", delta_color="normal")
-                    p5.metric("Momentum Score",  f"{mom_score:+.3f}",
-                              help="Price Momentum sub-score from Tradeability engine")
-
-                    # ── 52w range bar ─────────────────────────────────────────
-                    if hi_52 and lo_52 and hi_52 > lo_52:
-                        pct_in_range = (price - lo_52) / (hi_52 - lo_52) * 100
-                        st.markdown("**52-week range position**")
-                        st.markdown(
-                            f'<div style="position:relative;height:20px;background:rgba(255,255,255,0.05);'
-                            f'border-radius:10px;overflow:hidden;margin-bottom:4px">'
-                            f'<div style="position:absolute;left:0;top:0;height:100%;'
-                            f'width:{pct_in_range:.1f}%;background:linear-gradient('
-                            f'90deg,#f87171,#fbbf24,#22d3a0);border-radius:10px"></div>'
-                            f'<div style="position:absolute;left:{pct_in_range:.1f}%;top:0;'
-                            f'width:3px;height:100%;background:#e2e8f0;border-radius:2px"></div>'
-                            f'</div>'
-                            f'<div style="display:flex;justify-content:space-between;'
-                            f'font-family:IBM Plex Mono,monospace;font-size:10px;color:#64748b">'
-                            f'<span>52w Low ${lo_52:,.2f}</span>'
-                            f'<span style="color:#e2e8f0">{pct_in_range:.0f}% of range</span>'
-                            f'<span>52w High ${hi_52:,.2f}</span>'
-                            f'</div>',
-                            unsafe_allow_html=True,
-                        )
-
-                    # ── Full analysis + trade setup ───────────────────────────
-                    if "Full" in adhoc_mode:
-                        st.divider()
-                        st.markdown("**Full Tradeability + Trade Setup**")
-
-                        # Build a minimal tradeability result
-                        adhoc_trade = compute_tradeability(
-                            ticker=adhoc_ticker,
-                            sentiment_score=None,
-                            article_count=0,
-                            articles=[],
-                            sentiment_history=[],
-                            price_data=price_data_adhoc,
-                            earnings_events=[],
-                            daily_returns=daily_returns,
-                            weights=None,
-                        )
-
-                        t_score = adhoc_trade["score"]
-                        t_color = adhoc_trade["color"]
-                        t_label = adhoc_trade["label"]
-
-                        st.markdown(
-                            f'<div style="background:{t_color}18;border:1px solid {t_color}44;'
-                            f'border-radius:8px;padding:12px 18px;margin-bottom:12px;'
-                            f'display:flex;align-items:center;justify-content:space-between">'
-                            f'<div>'
-                            f'<div style="font-family:IBM Plex Mono,monospace;font-size:11px;'
-                            f'color:#64748b">TRADEABILITY (technical + momentum only — no sentiment)</div>'
-                            f'<div style="font-family:IBM Plex Mono,monospace;font-size:28px;'
-                            f'font-weight:700;color:{t_color}">{t_score:+.3f}</div>'
-                            f'</div>'
-                            f'<div style="font-family:IBM Plex Mono,monospace;font-size:16px;'
-                            f'font-weight:600;color:{t_color};background:{t_color}22;'
-                            f'padding:8px 18px;border-radius:6px;border:1px solid {t_color}44">'
-                            f'{t_label}</div>'
-                            f'</div>',
-                            unsafe_allow_html=True,
-                        )
-
-                        # ── Trade setup, priced from the live chain ───────────
-                        setup = generate_trade_setup(adhoc_ticker, adhoc_trade)
-
-                        if not setup.get("tradeable"):
-                            st.info(
-                                setup.get("rationale")
-                                or setup.get("error")
-                                or "No actionable setup for this ticker."
-                            )
-                        else:
-                            s1, s2, s3, s4 = st.columns(4)
-                            s1.metric("Strategy", setup["strategy"])
-                            s1.caption(f"{setup['expiry']} · {setup['dte']}d")
-                            s2.metric(
-                                "Credit" if setup["is_credit"] else "Debit",
-                                f"${abs(setup['net_debit']) * 100:,.0f}",
-                                help="Per contract, at a conservative fill.",
-                            )
-                            s3.metric(
-                                "Max loss",
-                                f"${setup['max_loss_per_contract']:,.0f}"
-                                if setup.get("max_loss_per_contract") else "—",
-                            )
-                            s4.metric(
-                                "Breakeven",
-                                f"${setup['breakeven']:.2f}" if setup.get("breakeven") else "—",
-                                delta=(f"{setup['breakeven_move_pct']:+.1f}%"
-                                       if setup.get("breakeven_move_pct") is not None else None),
-                            )
-
-                            st.markdown("**Legs**")
-                            st.dataframe(
-                                pd.DataFrame([
-                                    {
-                                        "Action": l["action"],
-                                        "Contract": f"{l['expiry']} ${l['strike']:g}{l['right']}",
-                                        "Bid": f"${l['bid']:.2f}", "Ask": f"${l['ask']:.2f}",
-                                        "Delta": f"{l['delta']:+.3f}" if l.get("delta") is not None else "—",
-                                        "IV": f"{l['iv']*100:.1f}%" if l.get("iv") else "—",
-                                        "OI": f"{l['open_interest']:,}",
-                                    }
-                                    for l in setup["legs"]
-                                ]),
-                                use_container_width=True, hide_index=True,
-                            )
-                            st.caption(
-                                f"Option R/R {setup['rr_ratio']:.2f}  ·  "
-                                f"PoP {setup['probability_of_profit']:.0f}%"
-                                if setup.get("probability_of_profit")
-                                else f"Option R/R {setup['rr_ratio']:.2f}"
-                            )
-                            st.caption(setup["rationale"])
-                            for warning in setup.get("warnings", []):
-                                st.warning(warning, icon="⚠️")
-                            st.warning(setup["disclaimer"])
-
-                except _AdhocPriceError as e:
-                    st.error(
-                        f"Could not retrieve a price for **{e.ticker}**. "
-                        f"Check the ticker symbol."
-                    )
-                except Exception as e:
-                    st.error(f"Analysis failed for {adhoc_ticker}: {e}")
-
-        elif adhoc_go and not adhoc_ticker:
-            st.warning("Please enter a ticker symbol.")
-
-    st.divider()
-
-    # ── KPI row ───────────────────────────────────────────────────────────────
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Companies Tracked", len(companies))
-    k2.metric("Total Articles", f"{total_articles:,}")
-    k3.metric("Upcoming Earnings", earnings_count, help="Next 7 days")
-    if recent_run:
-        k4.metric("Last Run", elapsed_str, help=f"Status: {recent_run.status}")
-    else:
-        k4.metric("Last Run", "Never")
-
-    st.divider()
-
-    # ── Rolling 2-week daily % change table ───────────────────────────────────
-    st.subheader("Rolling Price History — Daily % Change (14 trading days)")
-    st.caption("Live from Yahoo Finance. Cached for 15 minutes.")
-
-    @st.cache_data(ttl=900)
-    def fetch_price_history(tickers: tuple, days: int = 20):
-        """
-        Fetch daily close prices for all basket tickers via yfinance.
-        Returns a DataFrame of daily % changes, columns = tickers, rows = dates.
-        Uses extra days buffer to guarantee 14 trading days after weekends/holidays.
-        """
-        import yfinance as yf
-        from datetime import date, timedelta
-
-        end   = date.today()
-        start = end - timedelta(days=days)
-
-        try:
-            raw = yf.download(
-                list(tickers),
-                start=str(start),
-                end=str(end + timedelta(days=1)),
-                progress=False,
-                auto_adjust=True,
-            )
-            if raw.empty:
-                return None, None
-
-            # Extract Close prices — handle both single and multi-ticker formats
-            if isinstance(raw.columns, pd.MultiIndex):
-                closes = raw["Close"]
-            else:
-                closes = raw[["Close"]].rename(columns={"Close": tickers[0]})
-
-            closes = closes.dropna(how="all")
-
-            # Keep only the last 14 trading days
-            closes = closes.tail(14)
-
-            # Daily % change
-            pct_chg = closes.pct_change() * 100
-            pct_chg = pct_chg.iloc[1:]   # drop first row (NaN)
-
-            # Last close prices for the price row
-            last_prices = closes.iloc[-1]
-
-            return pct_chg, last_prices
-
-        except Exception as e:
-            return None, None
-
-    basket_tickers = tuple(c.ticker for c in companies)
-
-    if basket_tickers:
-        with st.spinner("Fetching price history…"):
-            pct_df, last_prices = fetch_price_history(basket_tickers)
-
-        if pct_df is None or pct_df.empty:
-            st.info("Price history unavailable — Yahoo Finance may be temporarily unreachable.")
-        else:
-            # ── Heatmap chart ─────────────────────────────────────────────────
-            # Reorder columns to match basket order
-            cols_ordered = [t for t in basket_tickers if t in pct_df.columns]
-            pct_df       = pct_df[cols_ordered]
-
-            # Build heatmap: rows=dates, columns=tickers
-            dates_fmt  = [d.strftime("%b %d") for d in pct_df.index]
-            z_values   = pct_df.values.tolist()
-
-            # Custom diverging colorscale: red → white → green
-            colorscale = [
-                [0.0,  "#ef4444"],
-                [0.35, "#fca5a5"],
-                [0.50, "#1e293b"],
-                [0.65, "#86efac"],
-                [1.0,  "#22d3a0"],
-            ]
-
-            fig_heat = go.Figure(go.Heatmap(
-                z=z_values,
-                x=cols_ordered,
-                y=dates_fmt,
-                colorscale=colorscale,
-                zmid=0,
-                zmin=-5,
-                zmax=5,
-                text=[[f"{v:+.2f}%" if v == v else "—" for v in row] for row in z_values],
-                texttemplate="%{text}",
-                textfont=dict(size=11, family="IBM Plex Mono"),
-                hovertemplate="<b>%{x}</b> on %{y}<br>Change: %{text}<extra></extra>",
-                colorbar=dict(
-                    title=dict(text="% Chg", font=dict(family="IBM Plex Mono", size=10, color="#94a3b8")),
-                    ticksuffix="%",
-                    thickness=12,
-                    len=0.8,
-                    tickfont=dict(family="IBM Plex Mono", size=10, color="#94a3b8"),
-                ),
-            ))
-            fig_heat.update_layout(
-                height=max(340, len(dates_fmt) * 26),
-                margin=dict(l=10, r=60, t=10, b=10),
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(0,0,0,0)",
-                font=dict(family="IBM Plex Mono", color="#94a3b8"),
-                xaxis=dict(side="top", tickangle=0, gridcolor="rgba(0,0,0,0)"),
-                yaxis=dict(autorange="reversed", gridcolor="rgba(255,255,255,0.04)"),
-            )
-            st.plotly_chart(fig_heat, use_container_width=True)
-
-            # ── Numeric table below heatmap ───────────────────────────────────
-            with st.expander("View as table", expanded=False):
-                display_df = pct_df.copy()
-                display_df.index = [d.strftime("%Y-%m-%d (%a)") for d in display_df.index]
-
-                # Format each cell
-                def fmt_cell(v):
-                    if v != v:  # NaN
-                        return "—"
-                    sign = "+" if v >= 0 else ""
-                    return f"{sign}{v:.2f}%"
-
-                styled = display_df.map(fmt_cell)
-                st.dataframe(styled, use_container_width=True)
-
-            # ── Per-ticker summary strip ───────────────────────────────────────
-            st.markdown("**14-day summary**")
-            sum_cols = st.columns(len(cols_ordered))
-            for col, ticker in zip(sum_cols, cols_ordered):
-                if ticker not in pct_df.columns:
-                    continue
-                series    = pct_df[ticker].dropna()
-                if series.empty:
-                    continue
-                total_chg = ((1 + series / 100).prod() - 1) * 100
-                best_day  = series.max()
-                worst_day = series.min()
-                up_days   = (series > 0).sum()
-                color     = "#22d3a0" if total_chg >= 0 else "#f87171"
-                sign      = "+" if total_chg >= 0 else ""
-                price_str = f"${last_prices[ticker]:.2f}" if last_prices is not None and ticker in last_prices else "—"
-
-                col.markdown(
-                    f'<div style="background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.07);'
-                    f'border-radius:6px;padding:8px 10px;text-align:center">'
-                    f'<div style="font-family:IBM Plex Mono,monospace;font-size:12px;'
-                    f'font-weight:600;color:#22d3a0">{ticker}</div>'
-                    f'<div style="font-family:IBM Plex Mono,monospace;font-size:10px;'
-                    f'color:#64748b;margin-bottom:4px">{price_str}</div>'
-                    f'<div style="font-family:IBM Plex Mono,monospace;font-size:16px;'
-                    f'font-weight:700;color:{color}">{sign}{total_chg:.1f}%</div>'
-                    f'<div style="font-size:9px;color:#475569;margin-top:3px">'
-                    f'{up_days}/{len(series)} up days</div>'
-                    f'<div style="font-size:9px;color:#334155">'
-                    f'Best {best_day:+.1f}% / Worst {worst_day:+.1f}%</div>'
-                    f'</div>',
-                    unsafe_allow_html=True,
-                )
-
-    session.close()
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# TRADEABILITY PAGE
-# ═══════════════════════════════════════════════════════════════════════════════
-elif page == "Tradeability":
-    st.title("Tradeability Score")
-    st.caption(
-        "A composite options-trading metric combining five signal categories. "
-        "Adjust the category weights below to match your trading style."
-    )
-
-    # ── Weight controls ───────────────────────────────────────────────────────
-    # All nine categories are exposed. The old panel only had five sliders, but
-    # the weights dict it produced was passed straight to _normalise_weights,
-    # which assigns 0.0 to any category missing from the dict — so simply opening
-    # this expander silently zeroed options_iv, volume, short_interest and
-    # analyst, i.e. 35% of the model including the IV regime signal.
-    CATEGORY_META = {
-        "sentiment":      {"label": "📰 Sentiment",      "color": "#60a5fa", "help": "News sentiment: recency-decayed score, momentum vs prior runs, source diversity. Deduplicated at the headline level so syndicated wire copy counts once."},
-        "technical":      {"label": "📈 Technical",      "color": "#22d3a0", "help": "52-week range position, day change, analyst consensus, breakout proximity. Ranked cross-sectionally within the basket."},
-        "price_momentum": {"label": "📉 Momentum",       "color": "#34d399", "help": "Wilder RSI over 120 bars, trend slope, annualised volatility, day streak, 5d vs 14d acceleration."},
-        "fundamental":    {"label": "📊 Fundamental",    "color": "#a78bfa", "help": "P/E percentile within the basket, average EPS surprise %, beat streak."},
-        "event_driven":   {"label": "⚡ Event-Driven",   "color": "#f87171", "help": "Earnings proximity (negative — IV crush risk for long options), last quarter's surprise, 52w high breakout."},
-        "volume":         {"label": "🔊 Volume",         "color": "#fbbf24", "help": "Today's volume vs the 30-day average, signed by price direction."},
-        "short_interest": {"label": "🩳 Short Interest",  "color": "#fb923c", "help": "Days to cover and short % of float, read as squeeze or distribution depending on price direction."},
-        "options_iv":     {"label": "🌊 Options IV",     "color": "#38bdf8", "help": "IV rank regime from stored option-chain history. Drives strategy selection: high rank favours selling premium, low rank favours buying it."},
-        "analyst":        {"label": "🎯 Analyst",        "color": "#c084fc", "help": "Consensus mean score and price-target upside, ranked within the basket."},
-    }
-
-    with st.expander("⚖️  Adjust category weights", expanded=False):
-        st.caption(
-            "How much each signal category contributes. Weights are re-normalised "
-            "to sum to 100%. Categories with no data are excluded entirely rather "
-            "than counted as neutral."
-        )
-
-        raw_weights = {}
-        for row_keys in (list(CATEGORY_META)[:5], list(CATEGORY_META)[5:]):
-            cols = st.columns(len(row_keys))
-            for col, key in zip(cols, row_keys):
-                meta = CATEGORY_META[key]
-                # `value=` and `key=` must not both be supplied — Streamlit then
-                # has two sources of truth for the widget and warns/desyncs.
-                # session_state seeded once is the correct pattern.
-                st.session_state.setdefault(f"tw_{key}", int(DEFAULT_WEIGHTS[key] * 100))
-                raw_weights[key] = col.slider(
-                    meta["label"], min_value=0, max_value=100, step=1,
-                    help=meta["help"], key=f"tw_{key}",
-                )
-
-        total_raw = sum(raw_weights.values())
-        if total_raw == 0:
-            st.warning("All weights are zero — falling back to defaults.")
-            weights = dict(DEFAULT_WEIGHTS)
-        else:
-            weights = {k: v / total_raw for k, v in raw_weights.items()}
-
-        pct_rows = (list(CATEGORY_META)[:5], list(CATEGORY_META)[5:])
-        for row_keys in pct_rows:
-            cols = st.columns(len(row_keys))
-            for col, key in zip(cols, row_keys):
-                col.markdown(
-                    f'<div style="text-align:center;font-family:IBM Plex Mono,monospace;'
-                    f'font-size:11px;color:{CATEGORY_META[key]["color"]}">'
-                    f'{weights[key]*100:.1f}%</div>',
-                    unsafe_allow_html=True,
-                )
-
-        if st.button("Reset to defaults", key="reset_weights"):
-            for key in CATEGORY_META:
-                st.session_state[f"tw_{key}"] = int(DEFAULT_WEIGHTS[key] * 100)
-            st.rerun()
-
-    st.divider()
-
-    # ── Compute scores ────────────────────────────────────────────────────────
-    results = cached_tradeability(weights)
-
-    if not results:
-        st.info("No data yet. Run the scraper first: `python3 -m mktscan run --mode all`")
-        st.stop()
-
-    # Warn when IV rank is unavailable — without it the strategy selector falls
-    # back to its least-informed branch, and the user should know that.
-    no_iv = [t for t, r in results.items() if r.get("iv_basis") != "chain"]
-    if len(no_iv) == len(results):
-        st.warning(
-            "**IV rank unavailable for the whole basket.** Strategy selection is "
-            "running on its fallback branch (debit spreads at reduced size). "
-            "Seed the history with `python3 -m mktscan iv --backfill`, then "
-            "`python3 -m mktscan iv --update` daily.",
-            icon="🌊",
-        )
-    elif no_iv:
-        st.caption(f"⚠️ IV rank unavailable for: {', '.join(sorted(no_iv))}")
-
-    # Sort by score descending
-    sorted_results = sorted(results.items(), key=lambda x: -x[1]["score"])
-
-    # ── KPI strip ─────────────────────────────────────────────────────────────
-    scores_list = [v["score"] for v in results.values()]
-    avg_trade   = sum(scores_list) / len(scores_list)
-    strong_buy  = sum(1 for s in scores_list if s >  0.50)
-    bearish     = sum(1 for s in scores_list if s < -0.20)
-    best        = sorted_results[0]
-    worst       = sorted_results[-1]
-
-    k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("Avg Tradeability", f"{avg_trade:+.3f}")
-    k2.metric("Strong Buy",       strong_buy)
-    k3.metric("Bearish / Avoid",  bearish)
-    k4.metric("Top Pick",         best[0],  delta=f"{best[1]['score']:+.3f}",  delta_color="normal")
-    k5.metric("Weakest",          worst[0], delta=f"{worst[1]['score']:+.3f}", delta_color="inverse")
-
-    st.divider()
-
-    # ── Main layout: scoreboard + detail panel ────────────────────────────────
-    col_board, col_detail = st.columns([2, 3])
-
-    with col_board:
-        st.subheader("Scoreboard")
-
-        # Horizontal bar chart
-        tickers_sorted = [t for t, _ in sorted_results]
-        scores_sorted  = [v["score"] for _, v in sorted_results]
-        colors_sorted  = [tradeability_color(s) for s in scores_sorted]
-        labels_sorted  = [tradeability_label(s) for s in scores_sorted]
-
-        fig = go.Figure()
-        fig.add_trace(go.Bar(
-            y=tickers_sorted,
-            x=scores_sorted,
-            orientation="h",
-            marker_color=colors_sorted,
-            text=[f"{s:+.3f}  {l}" for s, l in zip(scores_sorted, labels_sorted)],
-            textposition="outside",
-            hovertemplate="<b>%{y}</b><br>Score: %{x:.4f}<extra></extra>",
-        ))
-        fig.add_vline(x=0,     line_color="rgba(255,255,255,0.2)", line_width=1)
-        fig.add_vline(x=0.5,   line_color="#22d3a0", line_width=0.5, line_dash="dot")
-        fig.add_vline(x=0.2,   line_color="#86efac", line_width=0.5, line_dash="dot")
-        fig.add_vline(x=-0.2,  line_color="#fca5a5", line_width=0.5, line_dash="dot")
-        fig.add_vline(x=-0.5,  line_color="#f87171", line_width=0.5, line_dash="dot")
-        fig.update_layout(
-            height=max(320, len(tickers_sorted) * 44),
-            margin=dict(l=10, r=120, t=10, b=10),
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
-            font=dict(family="IBM Plex Mono", color="#94a3b8"),
-            xaxis=dict(range=[-1.15, 1.15], gridcolor="rgba(255,255,255,0.05)", zeroline=False),
-            yaxis=dict(gridcolor="rgba(0,0,0,0)"),
-            showlegend=False,
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-        # Score legend
-        st.markdown(
-            '<div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:4px">'
-            + "".join([
-                f'<div style="display:flex;align-items:center;gap:5px">'
-                f'<div style="width:10px;height:10px;border-radius:2px;background:{c}"></div>'
-                f'<span style="font-size:10px;color:#64748b;font-family:IBM Plex Mono,monospace">{l}</span>'
-                f'</div>'
-                for c, l in [
-                    ("#22d3a0","STRONG BUY > +0.5"),
-                    ("#86efac","BULLISH > +0.2"),
-                    ("#fbbf24","NEUTRAL"),
-                    ("#fca5a5","BEARISH < -0.2"),
-                    ("#f87171","STRONG SELL < -0.5"),
-                ]
-            ])
-            + '</div>',
-            unsafe_allow_html=True,
-        )
-
-    with col_detail:
-        st.subheader("Category Breakdown")
-
-        selected_ticker = st.selectbox(
-            "Inspect ticker",
-            tickers_sorted,
-            key="trade_inspect",
-        )
-        res = results.get(selected_ticker, {})
-        cats = res.get("categories", {})
-
-        if not cats:
-            st.info("No data for this ticker.")
-        else:
-            # Overall score badge
-            score = res["score"]
-            color = res["color"]
-            label = res["label"]
-            st.markdown(
-                f'<div style="background:rgba(255,255,255,0.03);border:1px solid {color}44;'
-                f'border-radius:8px;padding:14px 18px;margin-bottom:16px;'
-                f'display:flex;align-items:center;justify-content:space-between">'
-                f'<div>'
-                f'<div style="font-family:IBM Plex Mono,monospace;font-size:13px;color:#64748b">TRADEABILITY SCORE</div>'
-                f'<div style="font-family:IBM Plex Mono,monospace;font-size:32px;font-weight:700;color:{color}">'
-                f'{score:+.3f}</div>'
-                f'</div>'
-                f'<div style="font-family:IBM Plex Mono,monospace;font-size:16px;font-weight:600;'
-                f'color:{color};background:{color}18;padding:8px 16px;border-radius:6px;'
-                f'border:1px solid {color}44">{label}</div>'
-                f'</div>',
-                unsafe_allow_html=True,
-            )
-
-            # Category breakdown bars
-            for cat_key, meta in CATEGORY_META.items():
-                cat_data   = cats.get(cat_key, {})
-                cat_score  = cat_data.get("score", 0.0)
-                cat_conf   = cat_data.get("confidence", 0.0)
-                cat_detail = cat_data.get("detail", "—")
-                cat_weight = weights.get(cat_key, 0.0)
-                cat_color  = meta["color"]
-
-                # Extra pills for price momentum
-                extra_pills = ""
-                if cat_key == "price_momentum" and cat_data.get("rsi") is not None:
-                    rsi = cat_data["rsi"]
-                    vol = cat_data.get("annual_vol", 0)
-                    streak = cat_data.get("streak", 0)
-                    ret14 = cat_data.get("total_return_14d", 0)
-                    rsi_col = "#f87171" if rsi > 70 else "#22d3a0" if rsi < 30 else "#fbbf24"
-                    streak_col = "#22d3a0" if streak > 0 else "#f87171" if streak < 0 else "#64748b"
-                    ret_col = "#22d3a0" if ret14 >= 0 else "#f87171"
-                    extra_pills = (
-                        f'<div style="display:flex;gap:6px;margin-top:5px;flex-wrap:wrap">'
-                        f'<span style="font-family:IBM Plex Mono,monospace;font-size:10px;'
-                        f'background:rgba(255,255,255,0.05);padding:2px 7px;border-radius:3px;'
-                        f'color:{rsi_col}">RSI {rsi:.0f}</span>'
-                        f'<span style="font-family:IBM Plex Mono,monospace;font-size:10px;'
-                        f'background:rgba(255,255,255,0.05);padding:2px 7px;border-radius:3px;'
-                        f'color:#94a3b8">Vol {vol:.0f}%</span>'
-                        f'<span style="font-family:IBM Plex Mono,monospace;font-size:10px;'
-                        f'background:rgba(255,255,255,0.05);padding:2px 7px;border-radius:3px;'
-                        f'color:{streak_col}">Streak {streak_col and streak:+d}d</span>'
-                        f'<span style="font-family:IBM Plex Mono,monospace;font-size:10px;'
-                        f'background:rgba(255,255,255,0.05);padding:2px 7px;border-radius:3px;'
-                        f'color:{ret_col}">14d {ret14:+.1f}%</span>'
-                        f'</div>'
-                    )
-
-                bar_pct    = abs(cat_score) * 100
-                bar_color  = "#22d3a0" if cat_score >= 0 else "#f87171"
-
-                st.markdown(
-                    f'<div style="background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.06);'
-                    f'border-radius:6px;padding:10px 14px;margin-bottom:8px">'
-
-                    f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">'
-                    f'<span style="font-size:13px;color:#e2e8f0;font-weight:500">{meta["label"]}</span>'
-                    f'<div style="display:flex;align-items:center;gap:10px">'
-                    f'<span style="font-family:IBM Plex Mono,monospace;font-size:10px;color:#64748b">'
-                    f'weight {cat_weight*100:.0f}%</span>'
-                    f'<span style="font-family:IBM Plex Mono,monospace;font-size:14px;font-weight:600;'
-                    f'color:{bar_color}">{cat_score:+.3f}</span>'
-                    f'</div></div>'
-
-                    f'<div style="background:rgba(255,255,255,0.05);border-radius:3px;height:5px;'
-                    f'margin-bottom:6px;overflow:hidden">'
-                    f'<div style="width:{bar_pct:.0f}%;height:100%;background:{bar_color};'
-                    f'border-radius:3px;margin-left:{"0" if cat_score >= 0 else "auto"}"></div>'
-                    f'</div>'
-
-                    f'<div style="display:flex;justify-content:space-between;align-items:center">'
-                    f'{extra_pills}'
-                    f'<span style="font-size:10px;color:#475569;font-family:IBM Plex Mono,monospace">'
-                    f'{cat_detail[:80]}{"…" if len(cat_detail) > 80 else ""}</span>'
-                    f'<span style="font-size:10px;color:#334155;font-family:IBM Plex Mono,monospace">'
-                    f'conf {cat_conf:.0%}</span>'
-                    f'</div>'
-
-                    f'</div>',
-                    unsafe_allow_html=True,
-                )
-
-            # Component deep-dive
-            with st.expander("Component detail", expanded=False):
-                for cat_key, meta in CATEGORY_META.items():
-                    comps = cats.get(cat_key, {}).get("components", {})
-                    if not comps:
-                        continue
-                    st.markdown(f"**{meta['label']}**")
-                    comp_rows = [
-                        {"Component": k.replace("_", " ").title(),
-                         "Score": format_component_value(v)}
-                        for k, v in comps.items()
-                    ]
-                    st.dataframe(pd.DataFrame(comp_rows), use_container_width=True, hide_index=True)
-
-    st.divider()
-
-    # ── Trade Setups ──────────────────────────────────────────────────────────
-    st.subheader("Trade Setups — priced from the live option chain")
-    st.caption(
-        "Strikes are selected by delta from the actual chain and filtered for "
-        "liquidity (open interest, bid/ask spread). Every figure below — premium, "
-        "max loss, breakeven, risk/reward — is an option-level number, computed on "
-        "the structure itself rather than on the underlying."
-    )
-    st.warning(DISCLAIMER)
-
-    with st.spinner("Pricing option chains…"):
-        setups = cached_setups(results_digest(results), results)
-
-    if not setups:
-        st.info("No setups generated — run the scraper first to populate data.")
-    else:
-        tradeable = {t: s for t, s in setups.items() if s.get("tradeable")}
-        skipped   = {t: s for t, s in setups.items() if not s.get("tradeable")}
-
-        sc1, sc2, sc3 = st.columns(3)
-        sc1.metric("Tradeable setups", len(tradeable))
-        sc2.metric("No trade / avoid", len(skipped))
-        total_risk = sum(s.get("max_loss_per_contract") or 0 for s in tradeable.values())
-        sc3.metric("Total risk, 1 contract each", f"${total_risk:,.0f}")
-
-        # ── Summary table ─────────────────────────────────────────────────────
-        if tradeable:
-            summary_rows = []
-            for ticker, s in sorted(tradeable.items(),
-                                    key=lambda kv: -abs(kv[1].get("tradeability", 0))):
-                summary_rows.append({
-                    "Ticker":     ticker,
-                    "Score":      f"{s['tradeability']:+.3f}",
-                    "Strategy":   s["strategy"],
-                    "Expiry":     f"{s['expiry']} ({s['dte']}d)",
-                    "Net":        f"${s['net_debit']:+.2f}",
-                    "Max Loss":   f"${s['max_loss_per_contract']:,.0f}" if s.get("max_loss_per_contract") else "—",
-                    "Max Gain":   f"${s['max_profit_per_contract']:,.0f}" if s.get("max_profit_per_contract") else "unbounded",
-                    "Breakeven":  f"${s['breakeven']:.2f}" if s.get("breakeven") else "—",
-                    "BE Move":    f"{s['breakeven_move_pct']:+.1f}%" if s.get("breakeven_move_pct") is not None else "—",
-                    "PoP":        f"{s['probability_of_profit']:.0f}%" if s.get("probability_of_profit") else "—",
-                    "R/R":        f"{s['rr_ratio']:.2f}",
-                    "Size":       s["sizing"],
-                    "Conf":       s["confidence_tier"],
-                })
-            st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
-            st.caption(
-                "R/R is reward at the price target versus loss at the stop, both "
-                "computed by repricing the option structure with time decay — not "
-                "the ratio of the underlying's move, which is what the previous "
-                "version reported and which understated both sides substantially."
-            )
-
-        # ── Detail cards ──────────────────────────────────────────────────────
-        for ticker, s in sorted(setups.items(),
-                                key=lambda kv: -abs(kv[1].get("tradeability", 0))):
-            score     = s.get("tradeability", 0.0)
-            strategy  = s.get("strategy", "—")
-            direction = s.get("direction", "NEUTRAL")
-            dir_icon  = ("🟢" if direction == "BULLISH" else
-                         "🔴" if direction == "BEARISH" else "⚪")
-
-            if not s.get("tradeable"):
-                reason_text = {
-                    "earnings_too_close": "Earnings blackout",
-                    "no_edge":            "No directional edge",
-                    "illiquid":           "Options too illiquid",
-                    "no_chain":           "No chain in expiry window",
-                    "no_price":           "Price unavailable",
-                    "error":              "Error",
-                }.get(s.get("reason", ""), s.get("reason", "—"))
-
-                with st.expander(f"{ticker}  ·  ⚪ {reason_text}  ·  Score {score:+.3f}",
-                                 expanded=False):
-                    st.info(s.get("rationale") or s.get("error") or reason_text)
-                    if s.get("iv_note"):
-                        st.caption(s["iv_note"])
-                continue
-
-            header = (
-                f"{ticker}  ·  {dir_icon} {strategy}  ·  ${s['spot']:.2f}  ·  "
-                f"Risk ${s['max_loss_per_contract']:,.0f}/contract  ·  "
-                f"R/R {s['rr_ratio']:.2f}  ·  {s['confidence_tier']}"
-            )
-            with st.expander(header, expanded=abs(score) >= 0.35):
-
-                # ── Economics ─────────────────────────────────────────────────
-                st.markdown("**Trade economics** — per contract (100 shares)")
-                e1, e2, e3, e4, e5 = st.columns(5)
-                e1.metric(
-                    "Credit received" if s["is_credit"] else "Debit paid",
-                    f"${abs(s['net_debit']) * 100:,.0f}",
-                    help="At a conservative fill: pay the ask, receive the bid.",
-                )
-                e1.caption(f"mid ${abs(s['net_debit_mid']) * 100:,.0f}")
-
-                e2.metric("Max loss", f"${s['max_loss_per_contract']:,.0f}",
-                          help="Worst case at expiry. This is the capital at risk.")
-                e3.metric(
-                    "Max profit",
-                    f"${s['max_profit_per_contract']:,.0f}" if s.get("max_profit_per_contract") else "Unbounded",
-                )
-                if s.get("max_return_pct"):
-                    e3.caption(f"{s['max_return_pct']:.0f}% of risk")
-
-                e4.metric("Breakeven", f"${s['breakeven']:.2f}" if s.get("breakeven") else "—",
-                          delta=f"{s['breakeven_move_pct']:+.1f}%" if s.get("breakeven_move_pct") is not None else None,
-                          help="Underlying price at which the position breaks even at expiry.")
-                e5.metric("Prob. of profit",
-                          f"{s['probability_of_profit']:.0f}%" if s.get("probability_of_profit") else "—",
-                          help="Risk-neutral probability of finishing past breakeven. "
-                               "Not the same as probability of finishing in the money.")
-
-                # ── Legs ──────────────────────────────────────────────────────
-                st.markdown("**Legs**")
-                leg_rows = []
-                for leg in s["legs"]:
-                    leg_rows.append({
-                        "Action":  leg["action"],
-                        "Contract": f"{leg['expiry']} ${leg['strike']:g}{leg['right']}",
-                        "Bid":     f"${leg['bid']:.2f}",
-                        "Ask":     f"${leg['ask']:.2f}",
-                        "Mid":     f"${leg['mid']:.2f}",
-                        "Spread":  f"{leg['spread_pct']*100:.1f}%" if leg.get("spread_pct") else "—",
-                        "Delta":   f"{leg['delta']:+.3f}" if leg.get("delta") is not None else "—",
-                        "IV":      f"{leg['iv']*100:.1f}%" if leg.get("iv") else "—",
-                        "OI":      f"{leg['open_interest']:,}",
-                        "Vol":     f"{leg['volume']:,}",
-                    })
-                st.dataframe(pd.DataFrame(leg_rows), use_container_width=True, hide_index=True)
-
-                # ── Greeks and levels ─────────────────────────────────────────
-                g1, g2, g3, g4 = st.columns(4)
-                g1.metric("Net delta", f"{s['net_delta']:+.2f}",
-                          help="Share-equivalent exposure per contract: multiply by 100.")
-                g2.metric("Theta / day", f"${s['net_theta_per_day_per_contract']:+,.2f}",
-                          help="Expected daily P&L from time decay alone, holding price and IV constant.")
-                g3.metric("Vega", f"${s['net_vega_per_contract']:+,.2f}",
-                          help="P&L per 1-point change in implied volatility.")
-                g4.metric("Slippage est.", f"${s['slippage_per_contract']:,.0f}",
-                          help="Gap between a mid fill and the conservative fill quoted above.")
-
-                l1, l2, l3, l4 = st.columns(4)
-                l1.metric("Spot", f"${s['spot']:.2f}")
-                l1.caption(f"ATR ${s['atr']:.2f} ({s['atr_pct']:.1f}%)")
-                l2.metric("Price target", f"${s['price_target']:.2f}",
-                          delta=f"{(s['price_target']-s['spot'])/s['spot']*100:+.1f}%")
-                if s.get("resistance"):
-                    l2.caption(f"Resistance ${s['resistance']:.2f}")
-                l3.metric("Price stop", f"${s['price_stop']:.2f}",
-                          delta=f"{(s['price_stop']-s['spot'])/s['spot']*100:+.1f}%",
-                          delta_color="inverse")
-                if s.get("support"):
-                    l3.caption(f"Support ${s['support']:.2f}")
-                l4.metric("Option R/R", f"{s['rr_ratio']:.2f}")
-                l4.caption(
-                    f"+${s['pnl_at_target_per_contract']:,.0f} / "
-                    f"${s['pnl_at_stop_per_contract']:,.0f} at day {s['hold_days']}"
-                )
-
-                # ── Context ───────────────────────────────────────────────────
-                ctx = []
-                if s.get("rsi") is not None:
-                    ctx.append(f"RSI {s['rsi']:.0f}")
-                if s.get("annual_vol") is not None:
-                    ctx.append(f"realised vol {s['annual_vol']:.0f}%")
-                if s.get("iv_rank") is not None:
-                    ctx.append(f"IV rank {s['iv_rank']:.0f} ({s.get('iv_basis','?')})")
-                if s.get("avg_iv"):
-                    ctx.append(f"chain IV {s['avg_iv']*100:.0f}%")
-                if s.get("days_to_earn") is not None:
-                    ctx.append(f"earnings in {s['days_to_earn']}d")
-                if s.get("coverage") is not None:
-                    ctx.append(f"model coverage {s['coverage']*100:.0f}%")
-                if ctx:
-                    st.caption("  ·  ".join(ctx))
-
-                st.markdown("**Rationale**")
-                st.markdown(
-                    f'<div style="font-size:13px;color:#94a3b8;line-height:1.7;padding:12px 16px;'
-                    f'background:rgba(255,255,255,0.02);border-radius:6px;'
-                    f'border:1px solid rgba(255,255,255,0.06)">{s["rationale"]}</div>',
-                    unsafe_allow_html=True,
-                )
-                if s.get("iv_note"):
-                    st.markdown(
-                        f'<div style="font-size:12px;color:#fbbf24;padding:7px 12px;'
-                        f'margin-top:6px;background:rgba(251,191,36,0.08);border-radius:4px;'
-                        f'border-left:2px solid #fbbf24">{s["iv_note"]}</div>',
-                        unsafe_allow_html=True,
-                    )
-                for warning in s.get("warnings", []):
-                    st.warning(warning, icon="⚠️")
-
-    st.divider()
-
-    # ── Full basket comparison table ──────────────────────────────────────────
-    st.subheader("Full Basket Comparison")
-    table_rows = []
-    for ticker, res in sorted_results:
-        cats = res.get("categories", {})
-        table_rows.append({
-            "Ticker":          ticker,
-            "Tradeability":    f"{res['score']:+.3f}",
-            "Signal":          res["label"],
-            "Sentiment":      f"{cats.get('sentiment',{}).get('score',0):+.3f}",
-            "Technical":      f"{cats.get('technical',{}).get('score',0):+.3f}",
-            "Price Momentum": f"{cats.get('price_momentum',{}).get('score',0):+.3f}",
-            "Fundamental":    f"{cats.get('fundamental',{}).get('score',0):+.3f}",
-            "Event-Driven":   f"{cats.get('event_driven',{}).get('score',0):+.3f}",
-        })
-    st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
-
-    st.divider()
-
-    # ── Signal Accuracy & Feedback Panel ─────────────────────────────────────
-    st.subheader("Signal Accuracy & Feedback Calibration")
-    st.caption(
-        "Tracks how often each tradeability score correctly predicted the next-day "
-        "price direction. Builds over time — more runs = more accurate calibration. "
-        "The feedback adjustment is applied automatically to future scores."
-    )
-
-    session_fb = get_session()
-    basket_tickers_fb = [c.ticker for c in get_basket(session_fb)]
-    acc_stats_all = get_basket_accuracy_stats(session_fb, basket_tickers_fb)
-    session_fb.close()
-
-    # ── Pooled result first ───────────────────────────────────────────────────
-    # Per-ticker samples are small and will stay small for months; the pooled
-    # figure is the only one likely to reach a usable size in year one.
-    try:
-        from mktscan.feedback import get_aggregate_stats
-        _fb_session = get_session()
-        try:
-            agg = get_aggregate_stats(_fb_session, basket_tickers_fb)
-        finally:
-            _fb_session.close()
-    except Exception:
-        agg = {"n_observations": 0}
-
-    if agg.get("n_observations"):
-        a1, a2, a3, a4 = st.columns(4)
-        a1.metric("Pooled observations", f"{agg['n_observations']:,}",
-                  help=f"Across {agg.get('n_tickers', 0)} tickers, one per ticker per day.")
-        a2.metric("Direction accuracy", f"{agg['pct_correct']:.1f}%",
-                  delta=f"±{agg['std_error_pct']:.1f} SE")
-        a3.metric(
-            "Directional edge",
-            f"{agg['directional_edge_pct']:+.2f}%" if agg.get("directional_edge_pct") is not None else "—",
-            help="Average return on bullish calls minus average return on bearish "
-                 "calls. A model can look 'accurate' in a rising market simply by "
-                 "being long-biased; this is what separates that from real signal.",
-        )
-        a4.metric("Significant?", "Yes" if agg["statistically_significant"] else "Not yet",
-                  help="Whether accuracy is more than 2 standard errors from 50%.")
-        if not agg["statistically_significant"]:
-            st.caption(
-                f"⚠️ {agg['pct_correct']:.1f}% on {agg['n_observations']:,} observations "
-                f"is within 2 standard errors of a coin flip. Not yet evidence of an edge."
-            )
-
-    st.divider()
-
-    # ── Per-ticker table ──────────────────────────────────────────────────────
-    acc_rows = []
-    for tkr in basket_tickers_fb:
-        s = acc_stats_all.get(tkr, {})
-        n        = s.get("n_observations", 0)
-        acc      = s.get("pct_correct")
-        se       = s.get("std_error_pct")
-        bull_ret = s.get("avg_return_on_bull")
-        bear_ret = s.get("avg_return_on_bear")
-        edge     = s.get("directional_edge_pct")
-        acc_rows.append({
-            "Ticker":             tkr,
-            "Obs":                n,
-            "Horizon":            f"{s.get('horizon_days', 5)}d",
-            "Direction Accuracy": (f"{acc:.1f}% ±{se:.1f}" if acc is not None and se is not None
-                                   else f"{acc:.1f}%" if acc is not None else "—"),
-            "Avg Return (Bull)":  f"{bull_ret:+.2f}%" if bull_ret is not None else "—",
-            "Avg Return (Bear)":  f"{bear_ret:+.2f}%" if bear_ret is not None else "—",
-            "Edge":               f"{edge:+.2f}%" if edge is not None else "—",
-            "Significant":        "✅" if s.get("statistically_significant") else "—",
-        })
-
-    if any(r["Obs"] > 0 for r in acc_rows):
-        st.dataframe(pd.DataFrame(acc_rows), use_container_width=True, hide_index=True)
-        st.caption(
-            "One observation per ticker per trading day, resolved over a 5-day "
-            "horizon. Accuracy is shown with its binomial standard error — on "
-            "30 observations that is roughly ±9 percentage points, so treat "
-            "anything inside 41–59% as indistinguishable from chance."
-        )
-        st.info(
-            "**Score adjustment is disabled.** These statistics are recorded and "
-            "displayed but do not modify the tradeability scores you see. The "
-            "adjustment was ±15% at full confidence — smaller than the uncertainty "
-            "in the statistic driving it — and it silently changed a displayed "
-            "number. Re-enable via `FEEDBACK_ADJUSTMENT_ENABLED` in feedback.py "
-            "once the pooled edge above is stable and significant.",
-            icon="ℹ️",
-        )
-    else:
-        st.info(
-            "No feedback data yet. One prediction is recorded per ticker per "
-            "trading day and resolved 5 trading days later, so the first "
-            "statistics appear about a week after the scheduler starts."
-        )
-
-    # Per-ticker calibration chart (score vs actual return scatter)
-    tickers_with_data = [t for t in basket_tickers_fb
-                         if acc_stats_all.get(t, {}).get("n_observations", 0) >= 3]
-
-    if tickers_with_data:
-        sel_tkr = st.selectbox(
-            "View calibration chart for",
-            tickers_with_data,
-            key="fb_ticker_select"
-        )
-        hist = acc_stats_all[sel_tkr].get("history", [])
-        if hist:
-            df_hist = pd.DataFrame(hist)
-            fig_fb = go.Figure()
-
-            # Colour points by correct/incorrect
-            colors_fb = ["#22d3a0" if r["correct"] else "#f87171" for r in hist]
-            fig_fb.add_trace(go.Scatter(
-                x=df_hist["score"],
-                y=df_hist["actual"],
-                mode="markers",
-                marker=dict(color=colors_fb, size=9, opacity=0.8),
-                text=[f"{r['date']}<br>Score: {r['score']:+.3f}<br>Actual: {r['actual']:+.2f}%"
-                      for r in hist],
-                hovertemplate="%{text}<extra></extra>",
-                name="Outcomes",
-            ))
-
-            # Perfect calibration line (if score = 0.1 → actual = +0.3%)
-            xs = [-1.0, 1.0]
-            fig_fb.add_trace(go.Scatter(
-                x=xs, y=[x * 3 for x in xs],
-                mode="lines",
-                line=dict(color="rgba(255,255,255,0.15)", dash="dot", width=1),
-                name="Perfect calibration",
-                hoverinfo="skip",
-            ))
-            fig_fb.add_hline(y=0, line_color="rgba(255,255,255,0.2)", line_width=1)
-            fig_fb.add_vline(x=0, line_color="rgba(255,255,255,0.2)", line_width=1)
-
-            fig_fb.update_layout(
-                height=300,
-                margin=dict(l=10, r=10, t=30, b=10),
-                title=dict(
-                    text=f"{sel_tkr} — Score vs Next-Day Actual Return",
-                    font=dict(size=12, family="IBM Plex Mono", color="#94a3b8"),
-                ),
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(0,0,0,0)",
-                font=dict(family="IBM Plex Mono", color="#94a3b8"),
-                xaxis=dict(
-                    title="Tradeability Score at Prediction",
-                    gridcolor="rgba(255,255,255,0.05)",
-                    zeroline=False,
-                ),
-                yaxis=dict(
-                    title="Actual Next-Day Return (%)",
-                    gridcolor="rgba(255,255,255,0.05)",
-                    zeroline=False,
-                    ticksuffix="%",
-                ),
-                showlegend=True,
-                legend=dict(
-                    font=dict(size=10, family="IBM Plex Mono", color="#64748b"),
-                ),
-            )
-            st.plotly_chart(fig_fb, use_container_width=True)
-
-            # Feedback note for selected ticker
-            note = acc_stats_all[sel_tkr].get("feedback_note", "")
-            if note:
-                st.caption(f"Current adjustment: {note}")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# NEWS FEED PAGE
-# ═══════════════════════════════════════════════════════════════════════════════
-elif page == "News Feed":
-    st.title("News Feed")
-
-    session = get_session()
-    companies = get_basket(session)
-    tickers   = ["All", "MARKET (macro wire)"] + [c.ticker for c in companies]
-
-    col1, col2, col3 = st.columns([2, 2, 1])
-    with col1:
-        selected_ticker = st.selectbox("Filter by ticker", tickers)
-    with col2:
-        selected_source = st.selectbox(
-            "Filter by source", ["All", "reuters", "yahoo", "marketwatch", "finviz", "alphav", "benzinga", "wsj"]
-        )
-    with col3:
-        limit = st.number_input("Show", 20, 500, 50)
-
-    query = select(Article).order_by(desc(Article.scraped_at)).limit(limit)
-    actual_ticker = "MARKET" if selected_ticker == "MARKET (macro wire)" else selected_ticker
-    if selected_ticker != "All":
-        query = query.where(Article.ticker == actual_ticker)
-    if selected_source != "All":
-        query = query.where(Article.source == selected_source)
-
-    articles = session.execute(query).scalars().all()
-    session.close()
-
-    if not articles:
-        st.info("No articles found. Run the scraper to populate.")
-    else:
-        for a in articles:
-            score_str = ""
-            if a.sentiment is not None:
-                col = sentiment_color(a.sentiment)
-                score_str = f'<span style="color:{col};font-family:\'IBM Plex Mono\',monospace;font-size:12px;font-weight:600">{a.sentiment:+.3f}</span>'
-
-            pub = str(a.published_at)[:10] if a.published_at else "—"
-            st.markdown(
-                f'<div style="border-bottom:1px solid rgba(255,255,255,0.07);padding:10px 0">'
-                f'<div style="font-size:14px;margin-bottom:4px">{a.headline}</div>'
-                f'<div style="display:flex;gap:12px;align-items:center">'
-                f'<span style="font-family:\'IBM Plex Mono\',monospace;font-size:10px;'
-                f'color:#22d3a0;background:rgba(34,211,160,0.1);padding:1px 6px;border-radius:3px">'
-                f'{a.ticker}</span>'
-                f'<span style="font-size:11px;color:#64748b">{a.source}</span>'
-                f'<span style="font-size:11px;color:#475569">{pub}</span>'
-                f'{score_str}'
-                f'{"<a href=" + chr(34) + a.url + chr(34) + " target=_blank style=font-size:11px;color:#60a5fa>↗ link</a>" if a.url else ""}'
-                f'</div></div>',
-                unsafe_allow_html=True,
-            )
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# EARNINGS PAGE
-# ═══════════════════════════════════════════════════════════════════════════════
-elif page == "Earnings":
-    st.title("Earnings")
-
-    tab_cal, tab_hist = st.tabs(["📅  Upcoming Calendar", "📊  Historical Results"])
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # TAB 1 — UPCOMING CALENDAR
-    # ─────────────────────────────────────────────────────────────────────────
-    with tab_cal:
-        st.subheader("Broad Market — Next 30 Days")
-        st.caption(
-            "Earnings dates for ~80 major companies over the next 30 days, "
-            "sourced live from Yahoo Finance. Your basket companies are highlighted in green. "
-            "Results are cached for 1 hour."
-        )
-
-        @st.cache_data(ttl=3600)
-        def fetch_earnings_calendar():
-            import yfinance as yf
-
-            UNIVERSE = list(dict.fromkeys([
-                # Mega-cap tech
-                "AAPL","MSFT","NVDA","GOOG","GOOGL","META","AMZN","TSLA","AVGO","AMD","TSM",
-                # Broader tech
-                "ORCL","CRM","ADBE","INTC","QCOM","TXN","MU","AMAT","IBM","NOW","INTU",
-                "PANW","CRWD","FTNT","NET","SNOW","DDOG","PLTR",
-                # Finance
-                "JPM","BAC","WFC","GS","MS","C","BLK","SCHW","AXP","V","MA","PYPL","COF",
-                # Healthcare
-                "JNJ","UNH","PFE","MRK","ABBV","LLY","TMO","ABT","BMY","AMGN","GILD",
-                # Consumer
-                "WMT","COST","TGT","HD","MCD","SBUX","NKE","PG","KO","PEP","NFLX","DIS",
-                # Industrials / Energy
-                "XOM","CVX","COP","CAT","GE","HON","BA","UPS","FDX","LMT",
-            ]))
-
-            today   = datetime.now().date()
-            cutoff  = today + timedelta(days=30)
-            results = []
-
-            for sym in UNIVERSE:
-                try:
-                    t   = yf.Ticker(sym)
-                    cal = t.calendar
-                    if cal is None:
-                        continue
-                    if hasattr(cal, "to_dict"):
-                        cal = cal.to_dict()
-
-                    raw = cal.get("Earnings Date")
-                    if not raw:
-                        continue
-                    if isinstance(raw, list):
-                        raw = raw[0]
-                    d = raw.date() if hasattr(raw, "date") else raw
-                    if not (today <= d <= cutoff):
-                        continue
-
-                    def _fmt_range(lo, hi, fmt="${:.2f}", scale=1):
-                        try:
-                            return f"{fmt.format(float(lo)/scale)} – {fmt.format(float(hi)/scale)}"
-                        except Exception:
-                            return "—"
-
-                    eps_str = _fmt_range(cal.get("EPS Estimate Low"), cal.get("EPS Estimate High"))
-                    rev_str = _fmt_range(
-                        cal.get("Revenue Estimate Low"), cal.get("Revenue Estimate High"),
-                        fmt="${:.1f}B", scale=1e9,
-                    )
-                    results.append({"date": d, "ticker": sym,
-                                    "eps_range": eps_str, "rev_range": rev_str})
-                except Exception:
-                    continue
-
-            results.sort(key=lambda x: x["date"])
-            return results
-
-        with st.spinner("Loading earnings calendar…"):
-            cal_data = fetch_earnings_calendar()
-
-        if not cal_data:
-            st.info(
-                "No upcoming earnings found or Yahoo Finance is temporarily unavailable. "
-                "Try refreshing — results are cached for 1 hour."
-            )
-        else:
-            session        = get_session()
-            basket_tickers = {c.ticker for c in get_basket(session)}
-            session.close()
-
-            today = datetime.now().date()
-
-            # Group by week
-            from collections import defaultdict
-            week_groups = defaultdict(list)
-            for item in cal_data:
-                d      = item["date"]
-                monday = d - timedelta(days=d.weekday())
-                week_groups[monday].append(item)
-
-            DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri"]
-
-            for monday in sorted(week_groups):
-                friday     = monday + timedelta(days=4)
-                week_label = f"Week of {monday.strftime('%b %d')} — {friday.strftime('%b %d, %Y')}"
-                items      = week_groups[monday]
-
-                st.markdown(f"#### {week_label}")
-
-                # Map day-of-week → items
-                day_map = defaultdict(list)
-                for item in items:
-                    dow = item["date"].weekday()
-                    if dow < 5:
-                        day_map[dow].append(item)
-
-                cols = st.columns(5)
-                for i, (col, day_name) in enumerate(zip(cols, DAYS)):
-                    day_date  = monday + timedelta(days=i)
-                    is_today  = day_date == today
-                    is_past   = day_date < today
-                    day_items = day_map[i]
-
-                    # Day header
-                    if is_today:
-                        hdr_color = "#22d3a0"
-                        hdr_weight = "700"
-                        hdr_border = "2px solid #22d3a0"
-                    elif is_past:
-                        hdr_color = "#475569"
-                        hdr_weight = "400"
-                        hdr_border = "1px solid rgba(255,255,255,0.05)"
-                    else:
-                        hdr_color = "#94a3b8"
-                        hdr_weight = "400"
-                        hdr_border = "1px solid rgba(255,255,255,0.08)"
-
-                    col.markdown(
-                        f'<div style="font-family:IBM Plex Mono,monospace;font-size:11px;'
-                        f'color:{hdr_color};font-weight:{hdr_weight};padding:5px 8px;'
-                        f'border-bottom:{hdr_border};margin-bottom:6px">'
-                        f'{day_name} · {day_date.strftime("%b %d")}'
-                        f'{"  ← today" if is_today else ""}</div>',
-                        unsafe_allow_html=True,
-                    )
-
-                    if not day_items:
-                        col.markdown(
-                            '<div style="color:#334155;font-size:11px;'
-                            'font-family:IBM Plex Mono,monospace;padding:4px 8px">—</div>',
-                            unsafe_allow_html=True,
-                        )
-                    else:
-                        for item in day_items:
-                            in_basket  = item["ticker"] in basket_tickers
-                            bg         = "rgba(34,211,160,0.10)" if in_basket else "rgba(255,255,255,0.03)"
-                            tkr_color  = "#22d3a0"               if in_basket else "#94a3b8"
-                            border_col = "rgba(34,211,160,0.35)" if in_basket else "rgba(255,255,255,0.07)"
-                            col.markdown(
-                                f'<div style="background:{bg};border:1px solid {border_col};'
-                                f'border-radius:5px;padding:5px 8px;margin-bottom:5px">'
-                                f'<div style="font-family:IBM Plex Mono,monospace;font-size:12px;'
-                                f'font-weight:600;color:{tkr_color}">{item["ticker"]}'
-                                f'{"  ★" if in_basket else ""}</div>'
-                                f'<div style="font-size:10px;color:#64748b;margin-top:2px">'
-                                f'EPS: {item["eps_range"]}</div>'
-                                f'<div style="font-size:10px;color:#475569">'
-                                f'Rev: {item["rev_range"]}</div>'
-                                f'</div>',
-                                unsafe_allow_html=True,
-                            )
-
-                st.markdown("<br>", unsafe_allow_html=True)
-
-            # Full sortable table
-            with st.expander("View as full table", expanded=False):
-                rows = []
-                for item in cal_data:
-                    rows.append({
-                        "Date":       item["date"].strftime("%Y-%m-%d"),
-                        "Day":        item["date"].strftime("%A"),
-                        "Ticker":     item["ticker"],
-                        "In Basket":  "★" if item["ticker"] in basket_tickers else "",
-                        "EPS Est":    item["eps_range"],
-                        "Revenue Est":item["rev_range"],
-                        "Days Away":  (item["date"] - today).days,
-                    })
-                st.dataframe(
-                    pd.DataFrame(rows).sort_values("Date"),
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # TAB 2 — HISTORICAL RESULTS
-    # ─────────────────────────────────────────────────────────────────────────
-    with tab_hist:
-        st.subheader("Historical Earnings Results")
-
-        session   = get_session()
-        companies = get_basket(session)
-
-        if not companies:
-            st.warning("No companies in basket.")
-            session.close()
-        else:
-            # Company selector
-            ticker_options = ["All companies"] + [
-                f"{c.ticker} — {c.name}" for c in companies
-            ]
-            selected = st.selectbox("Company", ticker_options, key="earn_hist_select")
-            selected_ticker = None if selected == "All companies" else selected.split(" — ")[0]
-
-            # Pull historical earnings from DB
-            q = (
-                select(EarningsEvent)
-                .order_by(desc(EarningsEvent.report_date))
-                .limit(100)
-            )
-            if selected_ticker:
-                q = q.where(EarningsEvent.ticker == selected_ticker)
-            else:
-                basket_tickers = [c.ticker for c in companies]
-                q = q.where(EarningsEvent.ticker.in_(basket_tickers))
-
-            historical = session.execute(q).scalars().all()
-            session.close()
-
-            if not historical:
-                st.info(
-                    "No historical earnings data in the database yet. "
-                    "Run the scraper (`python3 -m mktscan run --mode earnings`) to populate."
-                )
-            else:
-                # ── KPI summary row ───────────────────────────────────────────
-                beats  = sum(1 for e in historical if e.surprise_pct and e.surprise_pct > 0)
-                misses = sum(1 for e in historical if e.surprise_pct and e.surprise_pct < 0)
-                total  = len([e for e in historical if e.surprise_pct is not None])
-                avg_surprise = (
-                    sum(e.surprise_pct for e in historical if e.surprise_pct) /
-                    len([e for e in historical if e.surprise_pct])
-                    if any(e.surprise_pct for e in historical) else 0
-                )
-
-                k1, k2, k3, k4 = st.columns(4)
-                k1.metric("Reports", len(historical))
-                k2.metric("EPS Beats", beats,  help="Reported EPS > estimate")
-                k3.metric("EPS Misses", misses, help="Reported EPS < estimate")
-                k4.metric("Avg Surprise", f"{avg_surprise:+.1f}%" if total else "—")
-
-                st.divider()
-
-                # ── EPS surprise bar chart ────────────────────────────────────
-                chart_data = [
-                    {
-                        "label":    f"{e.ticker} {e.period or ''}".strip(),
-                        "surprise": e.surprise_pct,
-                        "ticker":   e.ticker,
-                    }
-                    for e in historical if e.surprise_pct is not None
-                ]
-
-                if chart_data:
-                    st.markdown("**EPS Surprise % by report**")
-                    df_chart = pd.DataFrame(chart_data)
-                    fig = go.Figure(go.Bar(
-                        x=df_chart["label"],
-                        y=df_chart["surprise"],
-                        marker_color=[
-                            "#22d3a0" if s >= 0 else "#f87171"
-                            for s in df_chart["surprise"]
-                        ],
-                        text=[f"{s:+.1f}%" for s in df_chart["surprise"]],
-                        textposition="outside",
-                        hovertemplate="<b>%{x}</b><br>Surprise: %{y:+.2f}%<extra></extra>",
-                    ))
-                    fig.add_hline(y=0, line_color="rgba(255,255,255,0.25)", line_width=1)
-                    fig.update_layout(
-                        height=300,
-                        margin=dict(l=10, r=10, t=20, b=90),
-                        paper_bgcolor="rgba(0,0,0,0)",
-                        plot_bgcolor="rgba(0,0,0,0)",
-                        font=dict(family="IBM Plex Mono", color="#94a3b8"),
-                        xaxis=dict(tickangle=-40, gridcolor="rgba(255,255,255,0.04)"),
-                        yaxis=dict(
-                            gridcolor="rgba(255,255,255,0.04)",
-                            ticksuffix="%",
-                            zeroline=False,
-                        ),
-                        showlegend=False,
-                    )
-                    st.plotly_chart(fig, use_container_width=True)
-
-                # ── EPS estimate vs actual line chart (single ticker only) ────
-                if selected_ticker and len(historical) >= 2:
-                    eps_data = [
-                        {
-                            "Period":   e.period or str(e.report_date)[:7],
-                            "Estimate": e.eps_estimate,
-                            "Actual":   e.eps_actual,
-                        }
-                        for e in reversed(historical)
-                        if e.eps_estimate is not None or e.eps_actual is not None
-                    ]
-                    if eps_data:
-                        st.markdown(f"**EPS estimate vs actual — {selected_ticker}**")
-                        df_eps = pd.DataFrame(eps_data)
-                        fig2   = go.Figure()
-                        if "Estimate" in df_eps and df_eps["Estimate"].notna().any():
-                            fig2.add_trace(go.Scatter(
-                                x=df_eps["Period"], y=df_eps["Estimate"],
-                                name="Estimate",
-                                mode="lines+markers",
-                                line=dict(color="#60a5fa", width=2, dash="dot"),
-                                marker=dict(size=7),
-                            ))
-                        if "Actual" in df_eps and df_eps["Actual"].notna().any():
-                            fig2.add_trace(go.Scatter(
-                                x=df_eps["Period"], y=df_eps["Actual"],
-                                name="Actual",
-                                mode="lines+markers",
-                                line=dict(color="#22d3a0", width=2),
-                                marker=dict(size=7),
-                            ))
-                        fig2.update_layout(
-                            height=260,
-                            margin=dict(l=10, r=10, t=10, b=40),
-                            paper_bgcolor="rgba(0,0,0,0)",
-                            plot_bgcolor="rgba(0,0,0,0)",
-                            font=dict(family="IBM Plex Mono", color="#94a3b8"),
-                            xaxis=dict(tickangle=-30, gridcolor="rgba(255,255,255,0.04)"),
-                            yaxis=dict(gridcolor="rgba(255,255,255,0.04)", tickprefix="$"),
-                            legend=dict(
-                                orientation="h", yanchor="bottom",
-                                y=1.02, xanchor="right", x=1,
-                            ),
-                        )
-                        st.plotly_chart(fig2, use_container_width=True)
-
-                # ── Detail table ──────────────────────────────────────────────
-                st.markdown("**All reports**")
-                table_rows = []
-                for e in historical:
-                    surprise_str = f"{e.surprise_pct:+.1f}%" if e.surprise_pct is not None else "—"
-                    table_rows.append({
-                        "Ticker":      e.ticker,
-                        "Period":      e.period or "—",
-                        "Report Date": str(e.report_date)[:10] if e.report_date else "—",
-                        "EPS Est":     f"${e.eps_estimate:.2f}" if e.eps_estimate is not None else "—",
-                        "EPS Actual":  f"${e.eps_actual:.2f}"   if e.eps_actual   is not None else "—",
-                        "Surprise":    surprise_str,
-                        "Rev Est":     f"${e.revenue_estimate/1e9:.2f}B" if e.revenue_estimate else "—",
-                        "Rev Actual":  f"${e.revenue_actual/1e9:.2f}B"   if e.revenue_actual   else "—",
-                    })
-
-                st.dataframe(
-                    pd.DataFrame(table_rows),
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ECONOMIC CALENDAR PAGE
-# ═══════════════════════════════════════════════════════════════════════════════
-elif page == "Economic Calendar":
-    st.title("Economic Calendar")
-    st.caption("Major macro events for the current month — FOMC, CPI, PCE, jobs, GDP and more. Sourced live from MarketWatch. Cached for 2 hours.")
-
-    # ── Category colours & importance icons ──────────────────────────────────
-    CAT_COLORS = {
-        "Fed / Rates":   ("#4B8BFF", "rgba(75,139,255,0.12)"),
-        "Inflation":     ("#f87171", "rgba(248,113,113,0.12)"),
-        "Labour":        ("#22d3a0", "rgba(34,211,160,0.12)"),
-        "GDP":           ("#a78bfa", "rgba(167,139,250,0.12)"),
-        "Consumer":      ("#fbbf24", "rgba(251,191,36,0.10)"),
-        "Manufacturing": ("#60a5fa", "rgba(96,165,250,0.10)"),
-        "Housing":       ("#f59e0b", "rgba(245,158,11,0.10)"),
-        "Trade":         ("#34d399", "rgba(52,211,153,0.10)"),
-        "Treasury":      ("#94a3b8", "rgba(148,163,184,0.10)"),
-        "Other":         ("#64748b", "rgba(100,116,139,0.08)"),
-    }
-    IMP_ICONS = {"High": "🔴", "Medium": "🟡", "Low": "⚪"}
-
-    def _ref_month_name(year: int, month: int, months_back: int) -> str:
-        """
-        Name of the month ``months_back`` before (year, month).
-
-        Replaces ``f"Month {month-2 or 11}"``, which was wrong twice over: it
-        rendered a bare integer instead of a month name, and the ``or 11``
-        fallback only worked for February by accident. In January it evaluated
-        to -1.
-        """
-        total = year * 12 + (month - 1) - months_back
-        return f"{calendar.month_abbr[total % 12 + 1]} {total // 12}"
-
-    @st.cache_data(ttl=7200)
-    def fetch_econ_calendar():
-        """
-        Fetch economic calendar from MarketWatch.
-        Falls back to a curated static schedule of known recurring events
-        if the live scrape fails or returns too few events.
-        """
-        import sys
-        from pathlib import Path
-        sys.path.insert(0, str(Path(__file__).parent.parent))
-        from mktscan.scrapers.marketwatch import MarketWatchScraper
-
-        mw = MarketWatchScraper({"enabled": True}, delay=2.0)
-        try:
-            live = mw.fetch_economic_calendar()
-            if len(live) >= 5:
-                return live, "marketwatch"
-        except Exception as e:
-            pass
-
-        # ── Static fallback calendar ─────────────────────────────────────────
-        # Pre-populated with the most important recurring US economic releases.
-        # Dates are approximate; the live scrape will override these when available.
-        from datetime import date
-        today  = datetime.now().date()
-        year   = today.year
-        month  = today.month
-
-        def d(day):
+    fresh = data_freshness()
+    st.caption("DATA FRESHNESS")
+    st.caption(f"Price · {age_text(fresh['price'])}")
+    st.caption(f"Signals · {age_text(fresh['signal'])}")
+    st.caption(f"Options · {age_text(fresh['options'])}")
+    st.caption(f"Regime · {age_text(fresh['regime'])}")
+    if st.button("↻ Refresh", use_container_width=True):
+        st.cache_data.clear(); st.rerun()
+    with st.expander("System"):
+        st.caption("Expensive/admin actions stay out of the main workflow.")
+        if st.button("Run scraper now", use_container_width=True):
             try:
-                return date(year, month, day)
-            except ValueError:
-                return date(year, month, 28)
+                from mktscan.engine import MktScanEngine
+                with st.spinner("Running scraper…"):
+                    r = MktScanEngine().run("all")
+                st.success(f"Run complete: {getattr(r, 'tickers_scored', 'done')}")
+                st.cache_data.clear()
+            except Exception as e:
+                st.error(str(e))
 
-        STATIC = [
-            # Fed / Rates
-            {"name": "FOMC Rate Decision",               "category": "Fed / Rates",   "importance": "High",   "day_offset": 10, "time_str": "2:00 PM ET",  "period": f"Month {month}", "consensus": "—", "prior": "—"},
-            {"name": "Fed Chair Press Conference",       "category": "Fed / Rates",   "importance": "High",   "day_offset": 10, "time_str": "2:30 PM ET",  "period": f"Month {month}", "consensus": "—", "prior": "—"},
-            {"name": "FOMC Meeting Minutes",             "category": "Fed / Rates",   "importance": "High",   "day_offset": 18, "time_str": "2:00 PM ET",  "period": "Prior meeting",  "consensus": "—", "prior": "—"},
-            {"name": "Fed Beige Book",                   "category": "Fed / Rates",   "importance": "Medium", "day_offset": 14, "time_str": "2:00 PM ET",  "period": f"Month {month}", "consensus": "—", "prior": "—"},
-            # Inflation
-            {"name": "CPI — Consumer Price Index",       "category": "Inflation",     "importance": "High",   "day_offset": 11, "time_str": "8:30 AM ET",  "period": f"Month {month-1 or 12}", "consensus": "—", "prior": "—"},
-            {"name": "Core CPI (ex Food & Energy)",      "category": "Inflation",     "importance": "High",   "day_offset": 11, "time_str": "8:30 AM ET",  "period": f"Month {month-1 or 12}", "consensus": "—", "prior": "—"},
-            {"name": "PCE Price Index",                  "category": "Inflation",     "importance": "High",   "day_offset": 26, "time_str": "8:30 AM ET",  "period": f"Month {month-1 or 12}", "consensus": "—", "prior": "—"},
-            {"name": "Core PCE Price Index",             "category": "Inflation",     "importance": "High",   "day_offset": 26, "time_str": "8:30 AM ET",  "period": f"Month {month-1 or 12}", "consensus": "—", "prior": "—"},
-            {"name": "PPI — Producer Price Index",       "category": "Inflation",     "importance": "Medium", "day_offset": 13, "time_str": "8:30 AM ET",  "period": f"Month {month-1 or 12}", "consensus": "—", "prior": "—"},
-            # Labour
-            {"name": "Nonfarm Payrolls (NFP)",           "category": "Labour",        "importance": "High",   "day_offset":  4, "time_str": "8:30 AM ET",  "period": f"Month {month-1 or 12}", "consensus": "—", "prior": "—"},
-            {"name": "Unemployment Rate",                "category": "Labour",        "importance": "High",   "day_offset":  4, "time_str": "8:30 AM ET",  "period": f"Month {month-1 or 12}", "consensus": "—", "prior": "—"},
-            {"name": "Average Hourly Earnings",          "category": "Labour",        "importance": "High",   "day_offset":  4, "time_str": "8:30 AM ET",  "period": f"Month {month-1 or 12}", "consensus": "—", "prior": "—"},
-            {"name": "Initial Jobless Claims",           "category": "Labour",        "importance": "Medium", "day_offset":  3, "time_str": "8:30 AM ET",  "period": "Weekly",         "consensus": "—", "prior": "—"},
-            {"name": "Initial Jobless Claims",           "category": "Labour",        "importance": "Medium", "day_offset": 10, "time_str": "8:30 AM ET",  "period": "Weekly",         "consensus": "—", "prior": "—"},
-            {"name": "Initial Jobless Claims",           "category": "Labour",        "importance": "Medium", "day_offset": 17, "time_str": "8:30 AM ET",  "period": "Weekly",         "consensus": "—", "prior": "—"},
-            {"name": "Initial Jobless Claims",           "category": "Labour",        "importance": "Medium", "day_offset": 24, "time_str": "8:30 AM ET",  "period": "Weekly",         "consensus": "—", "prior": "—"},
-            {"name": "ADP Employment Report",            "category": "Labour",        "importance": "Medium", "day_offset":  3, "time_str": "8:15 AM ET",  "period": f"Month {month-1 or 12}", "consensus": "—", "prior": "—"},
-            {"name": "JOLTS Job Openings",               "category": "Labour",        "importance": "Medium", "day_offset":  8, "time_str": "10:00 AM ET", "period": f"{_ref_month_name(year, month, 2)}", "consensus": "—", "prior": "—"},
-            # GDP
-            {"name": "GDP — Advance Estimate",          "category": "GDP",           "importance": "High",   "day_offset": 25, "time_str": "8:30 AM ET",  "period": "Q1",             "consensus": "—", "prior": "—"},
-            {"name": "GDP — Second Estimate",            "category": "GDP",           "importance": "High",   "day_offset": 28, "time_str": "8:30 AM ET",  "period": "Q4 Prior",       "consensus": "—", "prior": "—"},
-            # Consumer
-            {"name": "Retail Sales",                     "category": "Consumer",      "importance": "High",   "day_offset": 15, "time_str": "8:30 AM ET",  "period": f"Month {month-1 or 12}", "consensus": "—", "prior": "—"},
-            {"name": "Consumer Confidence (Conference Board)", "category": "Consumer", "importance": "Medium", "day_offset": 28, "time_str": "10:00 AM ET", "period": f"Month {month}", "consensus": "—", "prior": "—"},
-            {"name": "U. of Michigan Consumer Sentiment","category": "Consumer",      "importance": "Medium", "day_offset": 10, "time_str": "10:00 AM ET", "period": f"Month {month} Prelim", "consensus": "—", "prior": "—"},
-            {"name": "Personal Spending",                "category": "Consumer",      "importance": "Medium", "day_offset": 26, "time_str": "8:30 AM ET",  "period": f"Month {month-1 or 12}", "consensus": "—", "prior": "—"},
-            # Manufacturing / Services
-            {"name": "ISM Manufacturing PMI",            "category": "Manufacturing", "importance": "Medium", "day_offset":  1, "time_str": "10:00 AM ET", "period": f"Month {month-1 or 12}", "consensus": "—", "prior": "—"},
-            {"name": "ISM Services PMI",                 "category": "Manufacturing", "importance": "Medium", "day_offset":  5, "time_str": "10:00 AM ET", "period": f"Month {month-1 or 12}", "consensus": "—", "prior": "—"},
-            {"name": "S&P Global Manufacturing PMI",     "category": "Manufacturing", "importance": "Low",    "day_offset": 22, "time_str": "9:45 AM ET",  "period": f"Month {month} Flash", "consensus": "—", "prior": "—"},
-            {"name": "Durable Goods Orders",             "category": "Manufacturing", "importance": "Medium", "day_offset": 24, "time_str": "8:30 AM ET",  "period": f"Month {month-1 or 12}", "consensus": "—", "prior": "—"},
-            # Housing
-            {"name": "Existing Home Sales",              "category": "Housing",       "importance": "Medium", "day_offset": 21, "time_str": "10:00 AM ET", "period": f"Month {month-1 or 12}", "consensus": "—", "prior": "—"},
-            {"name": "New Home Sales",                   "category": "Housing",       "importance": "Medium", "day_offset": 23, "time_str": "10:00 AM ET", "period": f"Month {month-1 or 12}", "consensus": "—", "prior": "—"},
-            {"name": "Housing Starts & Building Permits","category": "Housing",       "importance": "Medium", "day_offset": 16, "time_str": "8:30 AM ET",  "period": f"Month {month-1 or 12}", "consensus": "—", "prior": "—"},
-            # Trade
-            {"name": "Trade Balance",                    "category": "Trade",         "importance": "Medium", "day_offset":  7, "time_str": "8:30 AM ET",  "period": f"{_ref_month_name(year, month, 2)}", "consensus": "—", "prior": "—"},
-            # Treasury
-            {"name": "10-Year Treasury Note Auction",    "category": "Treasury",      "importance": "Medium", "day_offset":  9, "time_str": "1:00 PM ET",  "period": f"Month {month}", "consensus": "—", "prior": "—"},
-            {"name": "2-Year Treasury Note Auction",     "category": "Treasury",      "importance": "Low",    "day_offset": 22, "time_str": "1:00 PM ET",  "period": f"Month {month}", "consensus": "—", "prior": "—"},
-        ]
+area = st.session_state["area"]
+ticker = st.session_state["global_ticker"]
+regime = latest_regime()
+signals = latest_signal_rows()
+prices = latest_price_rows()
+options = latest_options_rows()
+earnings = upcoming_earnings()
 
-        from datetime import date as date_type
-        results = []
-        for ev in STATIC:
-            offset = ev.pop("day_offset")
-            try:
-                ev_date = date_type(year, month, min(offset, 28))
-            except ValueError:
-                ev_date = date_type(year, month, 28)
-            ev["date"]     = ev_date
-            ev["datetime"] = None
-            ev["actual"]   = ""
-            ev["source"]   = "static_fallback"
-            results.append(ev)
+# ─────────────────────────────────────────────────────────────────────────────
+# TODAY — orient, rank, act
+# ─────────────────────────────────────────────────────────────────────────────
+if area == "Today":
+    st.markdown("## Today")
+    st.caption("Market orientation, opportunities, open-position warnings, and meaningful changes.")
 
-        results.sort(key=lambda x: x["date"])
-        return results, "static_fallback"
-
-    with st.spinner("Loading economic calendar…"):
-        econ_events, data_source = fetch_econ_calendar()
-
-    if data_source == "static_fallback":
-        st.info(
-            "⚠️  Live MarketWatch data unavailable — showing a curated schedule of "
-            "recurring US economic releases. Dates are approximate. "
-            "Exact dates are confirmed closer to each release."
-        )
-    else:
-        st.success(f"Live data from MarketWatch — {len(econ_events)} events loaded")
-
-    if not econ_events:
-        st.warning("No events to display.")
-        st.stop()
-
-    # ── Filter controls ───────────────────────────────────────────────────────
-    today = datetime.now().date()
-
-    all_cats = sorted({e["category"] for e in econ_events})
-    col_f1, col_f2, col_f3 = st.columns([2, 2, 1])
-    with col_f1:
-        selected_cats = st.multiselect(
-            "Filter by category",
-            all_cats,
-            default=all_cats,
-            key="econ_cat_filter",
-        )
-    with col_f2:
-        selected_imp = st.multiselect(
-            "Importance",
-            ["High", "Medium", "Low"],
-            default=["High", "Medium"],
-            key="econ_imp_filter",
-        )
-    with col_f3:
-        show_past = st.checkbox("Show past events", value=True)
-
-    filtered = [
-        e for e in econ_events
-        if e["category"] in selected_cats
-        and e["importance"] in selected_imp
-        and (show_past or e["date"] >= today)
-    ]
-
-    if not filtered:
-        st.info("No events match your filters.")
-        st.stop()
-
-    # ── KPI summary strip ─────────────────────────────────────────────────────
-    high_count   = sum(1 for e in filtered if e["importance"] == "High")
-    remaining    = sum(1 for e in filtered if e["date"] >= today)
-    next_high    = next((e for e in sorted(filtered, key=lambda x: x["date"])
-                         if e["importance"] == "High" and e["date"] >= today), None)
-
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Total Events",    len(filtered))
-    k2.metric("High Importance", high_count)
-    k3.metric("Upcoming",        remaining)
-    k4.metric(
-        "Next Major Event",
-        next_high["name"][:22] + "…" if next_high and len(next_high["name"]) > 22
-        else (next_high["name"] if next_high else "—"),
-        delta=next_high["date"].strftime("%b %d") if next_high else None,
-        delta_color="off",
-    )
-
-    st.divider()
-
-    # ── Month view tab + List view tab ───────────────────────────────────────
-    view_cal, view_list = st.tabs(["🗓  Month View", "📋  List View"])
-
-    with view_cal:
-        # Build full calendar grid for current month
-        import calendar as cal_mod
-
-        # Determine which month to show
-        col_nav1, col_nav2, col_nav3 = st.columns([1, 3, 1])
-        with col_nav1:
-            if st.button("◀ Prev month"):
-                if "econ_month_offset" not in st.session_state:
-                    st.session_state.econ_month_offset = 0
-                st.session_state.econ_month_offset -= 1
-        with col_nav3:
-            if st.button("Next month ▶"):
-                if "econ_month_offset" not in st.session_state:
-                    st.session_state.econ_month_offset = 0
-                st.session_state.econ_month_offset += 1
-
-        offset = st.session_state.get("econ_month_offset", 0)
-        # Calendar-correct month arithmetic. `today.replace(day=1) + timedelta(days=32*offset)`
-        # drifts because months are not 32 days long: it accumulated ~19 days of
-        # error per year of navigation and skipped a month entirely after about
-        # ten clicks in one direction.
-        _total_months = (today.year * 12 + today.month - 1) + offset
-        view_date = date(_total_months // 12, _total_months % 12 + 1, 1)
-        view_month = view_date.month
-        view_year  = view_date.year
-        with col_nav2:
-            st.markdown(
-                f'<h3 style="text-align:center;font-family:IBM Plex Mono,monospace;'
-                f'color:#e2e8f0;margin:0">'
-                f'{view_date.strftime("%B %Y")}</h3>',
-                unsafe_allow_html=True,
-            )
-
-        # Map date → events for this month
-        from collections import defaultdict
-        day_events: dict = defaultdict(list)
-        for ev in filtered:
-            if ev["date"].year == view_year and ev["date"].month == view_month:
-                day_events[ev["date"].day].append(ev)
-
-        # Calendar grid
-        first_dow, days_in_month = cal_mod.monthrange(view_year, view_month)
-        DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-
-        # Header row
-        hdr_cols = st.columns(7)
-        for col, dn in zip(hdr_cols, DAY_NAMES):
-            is_weekend = dn in ("Sat", "Sun")
-            col.markdown(
-                f'<div style="text-align:center;font-family:IBM Plex Mono,monospace;'
-                f'font-size:11px;font-weight:600;color:{"#334155" if is_weekend else "#64748b"};'
-                f'padding:4px 0;border-bottom:1px solid rgba(255,255,255,0.07)">{dn}</div>',
-                unsafe_allow_html=True,
-            )
-
-        # Build list of day slots (None = padding)
-        slots = [None] * first_dow + list(range(1, days_in_month + 1))
-        # Pad to complete last row
-        while len(slots) % 7 != 0:
-            slots.append(None)
-
-        # Render weeks as rows
-        for week_start in range(0, len(slots), 7):
-            week_slots = slots[week_start:week_start + 7]
-            row_cols   = st.columns(7)
-
-            for col, day_num in zip(row_cols, week_slots):
-                if day_num is None:
-                    col.markdown(
-                        '<div style="min-height:80px;border:1px solid rgba(255,255,255,0.04);'
-                        'border-radius:4px;margin:1px"></div>',
-                        unsafe_allow_html=True,
-                    )
-                    continue
-
-                day_date   = today.replace(year=view_year, month=view_month, day=day_num)
-                is_today   = day_date == today
-                is_weekend = day_date.weekday() >= 5
-                is_past    = day_date < today
-                day_evs    = day_events.get(day_num, [])
-
-                # Sort by importance
-                imp_order  = {"High": 0, "Medium": 1, "Low": 2}
-                day_evs    = sorted(day_evs, key=lambda x: imp_order.get(x["importance"], 3))
-
-                # Cell background
-                if is_today:
-                    cell_bg     = "rgba(34,211,160,0.08)"
-                    day_border  = "1px solid rgba(34,211,160,0.4)"
-                    num_color   = "#22d3a0"
-                    num_weight  = "700"
-                elif is_weekend:
-                    cell_bg     = "rgba(0,0,0,0)"
-                    day_border  = "1px solid rgba(255,255,255,0.04)"
-                    num_color   = "#334155"
-                    num_weight  = "400"
-                elif is_past:
-                    cell_bg     = "rgba(0,0,0,0)"
-                    day_border  = "1px solid rgba(255,255,255,0.05)"
-                    num_color   = "#475569"
-                    num_weight  = "400"
-                else:
-                    cell_bg     = "rgba(255,255,255,0.02)"
-                    day_border  = "1px solid rgba(255,255,255,0.07)"
-                    num_color   = "#94a3b8"
-                    num_weight  = "400"
-
-                # Build event pills HTML
-                event_html = ""
-                for ev in day_evs[:4]:  # max 4 pills per cell
-                    cat_col, cat_bg = CAT_COLORS.get(ev["category"], ("#94a3b8", "rgba(148,163,184,0.1)"))
-                    imp_dot = (
-                        f'<span style="display:inline-block;width:5px;height:5px;'
-                        f'border-radius:50%;background:{"#f87171" if ev["importance"]=="High" else "#fbbf24" if ev["importance"]=="Medium" else "#475569"};'
-                        f'margin-right:3px;vertical-align:middle"></span>'
-                    )
-                    short_name = ev["name"][:22] + "…" if len(ev["name"]) > 22 else ev["name"]
-                    time_label = f'<div style="font-size:8px;color:#475569;margin-top:1px">{ev.get("time_str","")}</div>' if ev.get("time_str") else ""
-                    event_html += (
-                        f'<div style="background:{cat_bg};border:1px solid {cat_col}33;'
-                        f'border-radius:3px;padding:2px 5px;margin-bottom:3px;'
-                        f'{"opacity:0.5;" if is_past else ""}">'
-                        f'<div style="font-size:9px;color:{cat_col};line-height:1.3;font-family:IBM Plex Mono,monospace">'
-                        f'{imp_dot}{short_name}</div>'
-                        f'{time_label}'
-                        f'</div>'
-                    )
-
-                if len(day_events.get(day_num, [])) > 4:
-                    extra = len(day_events[day_num]) - 4
-                    event_html += f'<div style="font-size:9px;color:#475569;padding:1px 4px">+{extra} more</div>'
-
-                col.markdown(
-                    f'<div style="background:{cell_bg};border:{day_border};border-radius:6px;'
-                    f'padding:6px;min-height:80px;margin:1px">'
-                    f'<div style="font-family:IBM Plex Mono,monospace;font-size:12px;'
-                    f'color:{num_color};font-weight:{num_weight};margin-bottom:4px">{day_num}</div>'
-                    f'{event_html}'
-                    f'</div>',
-                    unsafe_allow_html=True,
-                )
-
-        # Legend
-        st.markdown("<br>", unsafe_allow_html=True)
-        st.markdown("**Category legend**")
-        leg_cols = st.columns(5)
-        for i, (cat, (color, bg)) in enumerate(CAT_COLORS.items()):
-            if cat == "Other":
-                continue
-            leg_cols[i % 5].markdown(
-                f'<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px">'
-                f'<div style="width:10px;height:10px;border-radius:2px;background:{bg};'
-                f'border:1px solid {color};flex-shrink:0"></div>'
-                f'<span style="font-size:11px;color:#94a3b8">{cat}</span>'
-                f'</div>',
-                unsafe_allow_html=True,
-            )
-
-    with view_list:
-        # Group by date
-        from collections import defaultdict as dd2
-        by_date = dd2(list)
-        for ev in sorted(filtered, key=lambda x: x["date"]):
-            by_date[ev["date"]].append(ev)
-
-        for ev_date, evs in by_date.items():
-            is_past = ev_date < today
-            is_today_row = ev_date == today
-
-            date_label = ev_date.strftime("%A, %B %d, %Y")
-            if is_today_row:
-                date_label += "  ← today"
-
-            st.markdown(
-                f'<div style="font-family:IBM Plex Mono,monospace;font-size:12px;'
-                f'font-weight:600;color:{"#22d3a0" if is_today_row else "#475569" if is_past else "#94a3b8"};'
-                f'margin:16px 0 6px 0;padding-bottom:4px;'
-                f'border-bottom:1px solid rgba(255,255,255,0.07)">{date_label}</div>',
-                unsafe_allow_html=True,
-            )
-
-            imp_order = {"High": 0, "Medium": 1, "Low": 2}
-            for ev in sorted(evs, key=lambda x: imp_order.get(x["importance"], 3)):
-                cat_col, cat_bg = CAT_COLORS.get(ev["category"], ("#94a3b8", "rgba(148,163,184,0.1)"))
-                imp_icon = IMP_ICONS.get(ev["importance"], "⚪")
-                actual_html = ""
-                if ev.get("actual") and ev["actual"] not in ("", "—"):
-                    actual_html = (
-                        f'<span style="font-size:10px;color:#22d3a0;'
-                        f'background:rgba(34,211,160,0.1);padding:1px 6px;'
-                        f'border-radius:3px;margin-left:8px">Actual: {ev["actual"]}</span>'
-                    )
-
-                consensus_html = ""
-                if ev.get("consensus") and ev["consensus"] not in ("", "—"):
-                    consensus_html = f'<span style="font-size:10px;color:#64748b">Est: {ev["consensus"]}</span>'
-
-                prior_html = ""
-                if ev.get("prior") and ev["prior"] not in ("", "—"):
-                    prior_html = f'<span style="font-size:10px;color:#475569">Prior: {ev["prior"]}</span>'
-
-                st.markdown(
-                    f'<div style="display:flex;align-items:flex-start;gap:12px;'
-                    f'padding:8px 10px;margin-bottom:4px;border-radius:6px;'
-                    f'background:{cat_bg if not is_past else "rgba(255,255,255,0.02)"};'
-                    f'border:1px solid {cat_col}22;'
-                    f'{"opacity:0.55;" if is_past else ""}">'
-                    f'<div style="min-width:44px;font-family:IBM Plex Mono,monospace;'
-                    f'font-size:10px;color:#64748b;padding-top:2px">{ev.get("time_str","")}</div>'
-                    f'<div style="flex:1">'
-                    f'<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">'
-                    f'<span style="font-size:13px;color:#e2e8f0;font-weight:500">'
-                    f'{imp_icon} {ev["name"]}</span>'
-                    f'<span style="font-size:10px;color:{cat_col};background:{cat_bg};'
-                    f'padding:1px 7px;border-radius:3px;border:1px solid {cat_col}44">'
-                    f'{ev["category"]}</span>'
-                    f'{actual_html}'
-                    f'</div>'
-                    f'<div style="display:flex;gap:12px;margin-top:4px;flex-wrap:wrap">'
-                    f'<span style="font-size:10px;color:#64748b">{ev.get("period","")}</span>'
-                    f'{consensus_html}{prior_html}'
-                    f'</div>'
-                    f'</div>'
-                    f'</div>',
-                    unsafe_allow_html=True,
-                )
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# BASKET PAGE
-# ═══════════════════════════════════════════════════════════════════════════════
-elif page == "Basket":
-    st.title("Watch Basket")
-
-    session = get_session()
-    companies = get_basket(session)
-
-    # ── Add company form ──
-    with st.expander("➕ Add Company", expanded=False):
-        c1, c2, c3 = st.columns([1, 2, 2])
-        new_ticker  = c1.text_input("Ticker", max_chars=10).upper()
-        new_name    = c2.text_input("Company Name")
-        new_sector  = c3.text_input("Sector (optional)")
-        new_kw      = st.text_input("Search Keywords (comma-separated)",
-                                     placeholder="e.g. Apple, iPhone, Tim Cook")
-        if st.button("Add to Basket", type="primary"):
-            if new_ticker and new_name:
-                upsert_company(session, new_ticker, new_name, new_sector, new_kw or new_ticker)
-                st.success(f"Added {new_ticker} — {new_name}")
-                st.rerun()
-            else:
-                st.error("Ticker and name are required.")
-
-    # ── Load preset ──
-    col1, col2, col3 = st.columns(3)
-    PRESETS = {
-        "Magnificent 7": [
-            ("AAPL","Apple Inc.","Technology","Apple, iPhone, Tim Cook"),
-            ("MSFT","Microsoft","Technology","Microsoft, Azure, Copilot"),
-            ("NVDA","NVIDIA","Semiconductors","NVIDIA, H100, Blackwell, Jensen Huang"),
-            ("GOOGL","Alphabet","Technology","Google, Gemini, YouTube"),
-            ("META","Meta Platforms","Social Media","Meta, Facebook, Instagram"),
-            ("AMZN","Amazon","E-Commerce","Amazon, AWS, Prime"),
-            ("TSLA","Tesla","EV / Auto","Tesla, Elon Musk, EV"),
-        ],
-        "US Financials": [
-            ("JPM","JPMorgan Chase","Finance","JPMorgan, Jamie Dimon"),
-            ("GS","Goldman Sachs","Finance","Goldman Sachs"),
-            ("BAC","Bank of America","Finance","Bank of America, BofA"),
-            ("V","Visa","Payments","Visa, payments"),
-            ("BRK-B","Berkshire Hathaway","Finance","Berkshire, Warren Buffett"),
-        ],
-        "Energy": [
-            ("XOM","ExxonMobil","Energy","ExxonMobil, oil"),
-            ("CVX","Chevron","Energy","Chevron, oil"),
-            ("NEE","NextEra Energy","Utilities","NextEra, wind, solar"),
-            ("SLB","Schlumberger","Oil Services","Schlumberger, SLB"),
-        ],
-    }
-
-    for i, (preset_name, data) in enumerate(PRESETS.items()):
-        col = [col1, col2, col3][i % 3]
-        if col.button(f"Load {preset_name}"):
-            for ticker, name, sector, kw in data:
-                upsert_company(session, ticker, name, sector, kw)
-            st.success(f"Loaded {preset_name} preset ({len(data)} companies)")
-            st.rerun()
-
-    st.divider()
-
-    # ── Company table with edit/remove ──
-    if not companies:
-        st.info("Basket is empty. Add companies above.")
-    else:
-        st.subheader(f"Current Basket ({len(companies)} companies)")
-        for c in companies:
-            with st.container():
-                cols = st.columns([1, 2, 2, 3, 1])
-                cols[0].markdown(f"**{c.ticker}**")
-                cols[1].text(c.name)
-                cols[2].text(c.sector or "—")
-                cols[3].text(c.keywords or "—")
-                if cols[4].button("✕", key=f"rm_{c.ticker}"):
-                    c.active = False
-                    session.commit()
-                    st.rerun()
-
-    session.close()
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# LIVE STOCK CHARTS PAGE
-# ═══════════════════════════════════════════════════════════════════════════════
-elif page == "Live Charts":
-    st.title("Live Stock Charts")
-    st.caption(
-        "Alpaca Market Data · live/near-live quote + intraday bars with EMA 9, EMA 20, "
-        "session VWAP and volume. Data are cached briefly and are not persisted to Postgres."
-    )
-
-    from mktscan.live_charts import CHART_RANGES, daily_relative_volume
-    from mktscan.providers.alpaca import AlpacaMarketDataError
-    from plotly.subplots import make_subplots
-
-    _lc_session = get_session()
+    open_s = get_session()
     try:
-        _lc_tickers = [c.ticker for c in get_basket(_lc_session)]
+        open_trades = open_s.execute(select(TradeJournalEntry).where(TradeJournalEntry.status == "OPEN").order_by(desc(TradeJournalEntry.opened_at))).scalars().all()
     finally:
-        _lc_session.close()
+        open_s.close()
+    marked_pnl = sum((trade_metrics(t, use_current=True).pnl or 0) for t in open_trades)
+    capital_risk = sum(float(t.planned_max_loss or 0) for t in open_trades)
+    macro = next_macro_event()
 
-    if not _lc_tickers:
-        st.info("Your basket is empty. Add tickers on the Basket page first.")
+    c1,c2,c3,c4,c5 = st.columns(5)
+    with c1: card("Market", regime.regime_label if regime else "UNKNOWN", f"confidence {(regime.confidence or 0):.0%}" if regime else "", signal_color(regime.regime_label if regime else ""))
+    with c2: card("VIX", f"{regime.vix:.1f}" if regime and regime.vix is not None else "—", regime.volatility_state if regime else "")
+    with c3: card("Open P&L", f"${marked_pnl:,.0f}", f"{len(open_trades)} open positions", "tv-bull" if marked_pnl >= 0 else "tv-bear")
+    with c4: card("Capital at Risk", f"${capital_risk:,.0f}", "journal planned max loss")
+    with c5:
+        if macro:
+            card("Next Event", macro.name[:28], macro.event_at.strftime("%a %H:%M UTC"))
+        else: card("Next Event", "None scheduled", "macro calendar")
+
+    st.markdown('<div class="tv-section">Top opportunities</div>', unsafe_allow_html=True)
+    rows=[]
+    for tk in tickers:
+        sig=signals.get(tk); p=prices.get(tk); opt=options.get(tk); earn=earnings.get(tk)
+        score=float(sig.score_at_prediction) if sig else None
+        ivpct=float(opt.iv_percentile_1y) if opt and opt.iv_percentile_1y is not None else (float(p.iv_percentile) if p and p.iv_percentile is not None else None)
+        # Today stays fast: use persisted signal/price/options only. Technicals load after drilldown.
+        qual=setup_quality(score, .75 if sig else 0, regime.regime_label if regime else None, None, ivpct, _event_days(earn))
+        rows.append({
+            "Ticker":tk, "Setup":qual["label"], "Signal":semantic_signal(score), "Score":round(score,2) if score is not None else None,
+            "IV":iv_state(ivpct), "Regime":regime.regime_label if regime else "UNKNOWN",
+            "Risk":f"Earnings {_event_days(earn)}d" if _event_days(earn) is not None and _event_days(earn)<=14 else "—",
+            "Price":round(float(p.price),2) if p and p.price is not None else None,
+            "Change %":round(float(p.change_pct),2) if p and p.change_pct is not None else None,
+            "_q":qual["score"],
+        })
+    df=pd.DataFrame(rows).sort_values(["_q","Score"], ascending=[False,False])
+    f1,f2=st.columns([1,3])
+    with f1: min_setup=st.selectbox("Minimum setup", ["All","Moderate+","High only"], index=1)
+    show=df.copy()
+    if min_setup=="Moderate+": show=show[show["Setup"].isin(["MODERATE","HIGH"])]
+    elif min_setup=="High only": show=show[show["Setup"]=="HIGH"]
+    st.dataframe(show.drop(columns=["_q"]), use_container_width=True, hide_index=True, height=min(500, 55+35*max(1,len(show))))
+    if not show.empty:
+        pick=st.selectbox("Review opportunity", show["Ticker"].tolist(), key="today_pick")
+        st.button("Open Research", type="primary", on_click=nav_to, args=("Research",pick,"Summary"))
+
+    st.markdown('<div class="tv-section">What changed</div>', unsafe_allow_html=True)
+    changes=change_feed()
+    if changes:
+        for e in changes[:8]:
+            st.markdown(f"**{e['ticker']}** · {e['text']}  \n<span class='tv-small'>{age_text(e['at'])}</span>", unsafe_allow_html=True)
     else:
-        default_feed = os.getenv("ALPACA_DATA_FEED", "iex").lower()
-        if default_feed not in {"iex", "sip"}:
-            default_feed = "iex"
+        st.caption("No material stored signal/IV/regime changes detected yet.")
 
-        c1, c2, c3, c4 = st.columns([2.2, 3.2, 1.6, 1.6])
-        with c1:
-            live_ticker = st.selectbox("Ticker", _lc_tickers, key="live_chart_ticker")
+    if open_trades:
+        st.markdown('<div class="tv-section">Open position warnings</div>', unsafe_allow_html=True)
+        for t in open_trades:
+            ed=_event_days(earnings.get(t.ticker))
+            msgs=[]
+            if ed is not None and ed<=7: msgs.append(f"earnings in {ed}d")
+            current_sig=signals.get(t.ticker)
+            if current_sig and t.direction=="BULLISH" and current_sig.score_at_prediction<-.2: msgs.append("signal flipped bearish")
+            if current_sig and t.direction=="BEARISH" and current_sig.score_at_prediction>.2: msgs.append("signal flipped bullish")
+            if msgs: st.warning(f"{t.ticker} · {t.strategy}: " + "; ".join(msgs))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RESEARCH — one ticker, conclusion first, diagnostics on demand
+# ─────────────────────────────────────────────────────────────────────────────
+elif area == "Research":
+    st.markdown(f"## {ticker} Research")
+    p=prices.get(ticker); sig=signals.get(ticker); opt=options.get(ticker); earn=earnings.get(ticker)
+    price_txt=f"${p.price:,.2f}" if p and p.price is not None else "—"
+    chg=float(p.change_pct) if p and p.change_pct is not None else None
+    st.caption(f"{price_txt}" + (f" · {chg:+.2f}%" if chg is not None else "") + f" · price {age_text(p.snapped_at) if p else 'unavailable'}")
+
+    if "research_section" not in st.session_state:
+        st.session_state["research_section"]="Summary"
+    section=st.radio("Research view", ["Summary","Chart","Options","Trade Builder","ChatGPT Research","Advanced"], key="research_section", horizontal=True, label_visibility="collapsed")
+
+    if section=="Summary":
+        with st.spinner("Calculating technical opportunity…"):
+            tech=technical_opportunity(ticker)
+        decision=build_decision(ticker,sig,regime,tech,opt,earn)
+        q=decision["quality"]
+        st.markdown('<div class="tv-section">Decision summary</div>', unsafe_allow_html=True)
+        l,r=st.columns([2,1])
+        with l:
+            direction=semantic_signal(decision["score"])
+            options_bias=decision["options"].structure_bias if decision["options"] else "Options context unavailable"
+            strengths=" · ".join(q["strengths"][:3]) or "No major strengths confirmed"
+            risks=" · ".join(decision["risks"][:3]) or "No major stored risk flags"
+            st.markdown(f"""
+<div class="tv-card">
+<div class="tv-kicker">Decision summary</div>
+<div class="tv-value {signal_color(direction)}">{decision['status']} · {direction}</div>
+<p>{ticker} has a <b>{q['label'].lower()}</b> setup ({q['score']}/100). {strengths}.</p>
+<p><b>Preferred expression:</b> {options_bias}</p>
+<p class="tv-small"><b>Primary risks:</b> {risks}</p>
+</div>
+""", unsafe_allow_html=True)
+        with r:
+            card("Setup Quality", f"{q['label']} · {q['score']}/100", "workflow heuristic, not a validated forecast")
+            card("Signal", semantic_signal(decision["score"]), f"raw {decision['score']:+.2f}" if decision["score"] is not None else "", signal_color(semantic_signal(decision["score"])))
+            card("IV", iv_state(float(opt.iv_percentile_1y) if opt and opt.iv_percentile_1y is not None else None), f"{opt.iv_percentile_1y:.0f}th percentile" if opt and opt.iv_percentile_1y is not None else "history unavailable")
+
+        st.markdown('<div class="tv-section">Setup scorecard</div>', unsafe_allow_html=True)
+        c1,c2,c3,c4=st.columns(4)
+        with c1: card("Trend",tech.trend_state,f"ADX {tech.adx14:.0f}" if tech.adx14 is not None else "ADX —",signal_color(tech.trend_state))
+        with c2: card("Momentum",tech.momentum_state,f"RSI {tech.rsi14:.0f}" if tech.rsi14 is not None else "RSI —",signal_color(tech.momentum_state))
+        with c3: card("Relative Strength",tech.relative_strength_state,f"vs QQQ {tech.rs_qqq_20d:+.1f}%" if tech.rs_qqq_20d is not None else "vs QQQ —")
+        with c4: card("Volume",tech.volume_state,f"RVOL {tech.rvol20:.2f}×" if tech.rvol20 is not None else "RVOL —")
+        st.caption("Strengths: " + (" · ".join(q["strengths"]) or "None confirmed"))
+        if decision["risks"]: st.warning("Risks: " + " · ".join(decision["risks"]))
+
+    elif section=="Chart":
+        feed=os.getenv("ALPACA_DATA_FEED","iex").lower()
+        c1,c2,c3=st.columns([1,1,5])
+        with c1: rng=st.selectbox("Range",["1D","5D","1M","3M","6M","1Y"],index=0)
         with c2:
-            live_range = st.radio(
-                "Range", list(CHART_RANGES.keys()), horizontal=True, key="live_chart_range"
-            )
-        with c3:
-            feed_choices = ["iex", "sip"]
-            live_feed = st.selectbox(
-                "Feed", feed_choices, index=feed_choices.index(default_feed),
-                format_func=lambda x: {"iex": "IEX", "sip": "SIP"}[x],
-                help="IEX is commonly available on Alpaca's basic market-data access. SIP requires the corresponding entitlement."
-            )
-        with c4:
-            live_interval = st.selectbox("Refresh", [15, 30, 60], format_func=lambda x: f"{x}s")
-
-        o1, o2, o3, o4 = st.columns([1.4, 1.2, 1.2, 4.0])
-        with o1:
-            live_auto = st.toggle("Auto refresh", value=True, key="live_chart_auto")
-        with o2:
-            show_ema9 = st.checkbox("EMA 9", value=True, key="live_ema9")
-        with o3:
-            show_ema20 = st.checkbox("EMA 20", value=True, key="live_ema20")
-        with o4:
-            show_vwap = st.checkbox("VWAP (intraday)", value=True, key="live_vwap")
-
-        if "live_refresh_nonce" not in st.session_state:
-            st.session_state.live_refresh_nonce = 0
-
-        run_every = f"{live_interval}s" if live_auto else None
-
-        @st.fragment(run_every=run_every)
-        def render_live_chart():
-            top_left, top_right = st.columns([5, 1])
-            with top_right:
-                if st.button("↻ Refresh now", use_container_width=True, key="live_refresh_now"):
-                    st.session_state.live_refresh_nonce += 1
-
-            nonce = int(st.session_state.live_refresh_nonce)
-            try:
-                quote = cached_live_quote(live_ticker, live_feed, nonce)
-                bars = cached_live_bars(live_ticker, live_range, live_feed, nonce)
-                daily = cached_daily_bars(live_ticker, live_feed, nonce)
-            except AlpacaMarketDataError as exc:
-                st.error(str(exc))
-                st.info(
-                    "Add `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` to the Railway dashboard service. "
-                    "Use `ALPACA_DATA_FEED=iex` unless your Alpaca plan includes SIP access."
-                )
-                return
-            except Exception as exc:
-                st.error(f"Live market-data request failed: {exc}")
-                return
-
+            if st.button("Refresh chart"):
+                st.session_state["chart_nonce"]=st.session_state.get("chart_nonce",0)+1
+        nonce=st.session_state.get("chart_nonce",0)
+        try:
+            q=live_quote(ticker,feed,nonce); bars=live_bars(ticker,rng,feed,nonce)
             if bars is None or bars.empty:
-                st.warning(f"No {live_range} bars returned for {live_ticker} from the {live_feed.upper()} feed.")
-                return
-
-            daily_rvol = daily_relative_volume(daily, quote.day_volume)
-            last = quote.last
-            change = quote.change
-            change_pct = quote.change_pct
-
-            with top_left:
-                if last is not None:
-                    delta = None
-                    if change is not None and change_pct is not None:
-                        delta = f"{change:+.2f} ({change_pct:+.2f}%)"
-                    st.metric(f"{live_ticker} · {live_feed.upper()}", f"${last:,.2f}", delta=delta)
-                else:
-                    st.metric(f"{live_ticker} · {live_feed.upper()}", "—")
-
-            q1, q2, q3, q4, q5, q6 = st.columns(6)
-            q1.metric("Bid", f"${quote.bid:,.2f}" if quote.bid is not None else "—")
-            q2.metric("Ask", f"${quote.ask:,.2f}" if quote.ask is not None else "—")
-            q3.metric("Spread", f"${quote.spread:,.3f}" if quote.spread is not None else "—")
-            q4.metric("Day High", f"${quote.day_high:,.2f}" if quote.day_high is not None else "—")
-            q5.metric("Day Low", f"${quote.day_low:,.2f}" if quote.day_low is not None else "—")
-            q6.metric("Daily RVOL", f"{daily_rvol:.2f}×" if daily_rvol is not None else "—")
-
-            # Plot in New York time to make market sessions intuitive.
-            x = bars["market_time"] if "market_time" in bars.columns else bars["timestamp"]
-            price_fig = go.Figure()
-            price_fig.add_trace(go.Candlestick(
-                x=x, open=bars["open"], high=bars["high"], low=bars["low"], close=bars["close"],
-                name=live_ticker,
-            ))
-            if show_ema9 and "ema_9" in bars:
-                price_fig.add_trace(go.Scatter(x=x, y=bars["ema_9"], mode="lines", name="EMA 9"))
-            if show_ema20 and "ema_20" in bars:
-                price_fig.add_trace(go.Scatter(x=x, y=bars["ema_20"], mode="lines", name="EMA 20"))
-            if show_vwap and "vwap" in bars and bars["vwap"].notna().any():
-                price_fig.add_trace(go.Scatter(x=x, y=bars["vwap"], mode="lines", name="VWAP"))
-            price_fig.update_layout(
-                height=560,
-                margin=dict(l=10, r=10, t=36, b=10),
-                title=f"{live_ticker} · {live_range} · {CHART_RANGES[live_range].timeframe}",
-                xaxis_rangeslider_visible=False,
-                hovermode="x unified",
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-            )
-            price_fig.update_xaxes(title=None)
-            price_fig.update_yaxes(title="Price ($)")
-            st.plotly_chart(price_fig, use_container_width=True, key=f"live-price-{live_ticker}-{live_range}")
-
-            volume_fig = go.Figure()
-            volume_fig.add_trace(go.Bar(x=x, y=bars["volume"], name="Volume"))
-            if "volume_sma_20" in bars:
-                volume_fig.add_trace(go.Scatter(x=x, y=bars["volume_sma_20"], mode="lines", name="20-bar avg"))
-            volume_fig.update_layout(
-                height=220,
-                margin=dict(l=10, r=10, t=25, b=10),
-                hovermode="x unified",
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-            )
-            volume_fig.update_yaxes(title="Volume")
-            st.plotly_chart(volume_fig, use_container_width=True, key=f"live-volume-{live_ticker}-{live_range}")
-
-            latest = bars.iloc[-1]
-            i1, i2, i3, i4 = st.columns(4)
-            i1.metric("EMA 9", f"${latest['ema_9']:,.2f}" if pd.notna(latest.get("ema_9")) else "—")
-            i2.metric("EMA 20", f"${latest['ema_20']:,.2f}" if pd.notna(latest.get("ema_20")) else "—")
-            i3.metric("VWAP", f"${latest['vwap']:,.2f}" if pd.notna(latest.get("vwap")) else "—")
-            i4.metric("Bar RVOL", f"{latest['bar_rvol']:.2f}×" if pd.notna(latest.get("bar_rvol")) else "—")
-
-            if quote.timestamp:
-                ts = pd.Timestamp(quote.timestamp)
-                if ts.tzinfo is None:
-                    ts = ts.tz_localize("UTC")
-                ts = ts.tz_convert("America/New_York")
-                st.caption(
-                    f"Latest quote/trade timestamp: {ts.strftime('%Y-%m-%d %H:%M:%S %Z')} · "
-                    f"Source: Alpaca/{live_feed.upper()} · cache TTL 15s"
-                )
+                st.info("No live bars returned for this range.")
             else:
-                st.caption(f"Source: Alpaca/{live_feed.upper()} · cache TTL 15s")
-
-        if not os.getenv("ALPACA_API_KEY") and not os.getenv("APCA_API_KEY_ID"):
-            st.warning(
-                "Alpaca credentials are not configured on this service yet. Add `ALPACA_API_KEY` and "
-                "`ALPACA_SECRET_KEY` in Railway, then redeploy the dashboard."
-            )
-        render_live_chart()
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# OPTIONS MARKET PAGE
-# ═══════════════════════════════════════════════════════════════════════════════
-elif page == "Options Market":
-    st.title("Options Market v2")
-    st.caption(
-        "IV rank/percentile, volatility term structure, 25Δ skew, "
-        "and option-implied expected move from Yahoo today or ORATS when selected. This is research context and does not "
-        "change tradeability weights yet."
-    )
-    from mktscan.options_market import latest_options_market, refresh_options_market
-
-    om_session = get_session()
-    basket_om = get_basket(om_session)
-    om_tickers = [c.ticker for c in basket_om]
-    c1, c2, c3 = st.columns([3, 2, 1])
-    with c1:
-        selected_om = st.selectbox("Ticker", ["All"] + om_tickers, key="options_market_ticker")
-    with c2:
-        source_om = st.selectbox("Source", ["yahoo", "orats"], format_func=str.upper, key="options_market_source")
-    with c3:
-        st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
-        refresh_om = st.button("Refresh", type="primary", use_container_width=True)
-
-    if refresh_om:
-        targets = om_tickers if selected_om == "All" else [selected_om]
-        try:
-            with st.spinner(f"Fetching ORATS options analytics for {len(targets)} ticker(s)…"):
-                refresh_options_market(om_session, targets, source=source_om)
-            st.success("Options-market snapshots refreshed.")
-        except Exception as exc:
-            st.error(f"Options-market refresh failed: {exc}")
-
-    rows = (latest_options_market(om_session) if selected_om == "All"
-            else [latest_options_market(om_session, selected_om)])
-    rows = [r for r in rows if r is not None]
-    om_session.close()
-
-    if not rows:
-        st.info(
-            "No options-market snapshots yet. Run `python -m mktscan options-market --refresh` "
-            "or use the button above. Yahoo requires no new key; ORATS requires `ORATS_API_TOKEN`."
-        )
-    else:
-        data = []
-        for r in rows:
-            data.append({
-                "Ticker": r.ticker,
-                "Date": r.snapshot_date,
-                "ATM IV": r.atm_iv * 100 if r.atm_iv is not None else None,
-                "IV Rank 1Y": r.iv_rank_1y,
-                "IV Percentile 1Y": r.iv_percentile_1y,
-                "IV 30D": r.iv_30d * 100 if r.iv_30d is not None else None,
-                "IV 60D": r.iv_60d * 100 if r.iv_60d is not None else None,
-                "IV 90D": r.iv_90d * 100 if r.iv_90d is not None else None,
-                "Term": r.term_state,
-                "Put 25Δ Skew": r.put_skew * 100 if r.put_skew is not None else None,
-                "Call 25Δ Skew": r.call_skew * 100 if r.call_skew is not None else None,
-                "Expected Move %": r.expected_move_pct,
-                "Expected Move $": r.expected_move_dollars,
-                "Source": r.source,
-            })
-        import pandas as _pd
-        om_df = _pd.DataFrame(data)
-        st.dataframe(
-            om_df,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "ATM IV": st.column_config.NumberColumn(format="%.1f%%"),
-                "IV 30D": st.column_config.NumberColumn(format="%.1f%%"),
-                "IV 60D": st.column_config.NumberColumn(format="%.1f%%"),
-                "IV 90D": st.column_config.NumberColumn(format="%.1f%%"),
-                "Put 25Δ Skew": st.column_config.NumberColumn(format="%.2f"),
-                "Call 25Δ Skew": st.column_config.NumberColumn(format="%.2f"),
-                "Expected Move %": st.column_config.NumberColumn(format="%.1f%%"),
-                "Expected Move $": st.column_config.NumberColumn(format="$%.2f"),
-            },
-        )
-        if len(rows) == 1:
-            r = rows[0]
-            a, b, c, d = st.columns(4)
-            a.metric("IV Rank", f"{r.iv_rank_1y:.0f}" if r.iv_rank_1y is not None else "—")
-            b.metric("IV Percentile", f"{r.iv_percentile_1y:.0f}" if r.iv_percentile_1y is not None else "—")
-            c.metric("Term Structure", r.term_state or "—")
-            d.metric("Expected Move", f"±{r.expected_move_pct:.1f}%" if r.expected_move_pct is not None else "—")
-
-            # Interpretation is intentionally display-only. Pull the latest recorded
-            # tradeability prediction when available, but do not modify either model.
-            from mktscan.options_interpretation import interpret_options_market
-            from mktscan.database import TradeabilityOutcome
-            from sqlalchemy import select as _om_select
-            _is = get_session()
-            _pred = _is.execute(
-                _om_select(TradeabilityOutcome)
-                .where(TradeabilityOutcome.ticker == r.ticker)
-                .order_by(TradeabilityOutcome.predicted_at.desc())
-                .limit(1)
-            ).scalar_one_or_none()
-            _is.close()
-            _score = _pred.score_at_prediction if _pred else None
-            _label = _pred.label_at_prediction if _pred else None
-            interp = interpret_options_market(r, _score, _label)
-
-            st.subheader("Options Interpretation")
-            st.caption("Display-only research interpretation. It does not alter tradeability, strategy selection, or position sizing.")
-            x1, x2, x3 = st.columns(3)
-            x1.metric("Relative IV", interp.iv_state)
-            x2.metric("Underlying Bias", _label or "Unknown")
-            x3.metric("Structure Bias", interp.structure_bias)
-
-            st.markdown(f"**Thesis:** {interp.thesis}")
-            with st.expander("Why this interpretation?", expanded=True):
-                st.markdown(f"**Term structure:** {interp.term_view}")
-                st.markdown(f"**Skew:** {interp.skew_view}")
-                st.markdown(f"**Expected move:** {interp.move_view}")
-            if interp.cautions:
-                st.warning("\n".join(f"• {item}" for item in interp.cautions))
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# TRADE JOURNAL PAGE
-# ═══════════════════════════════════════════════════════════════════════════════
-elif page == "Trade Journal":
-    st.title("Trade Journal v1")
-    st.caption(
-        "Log real trades, freeze MktScan context at entry, and measure your realized execution performance. "
-        "Journal results are kept separate from model/backtest outcomes."
-    )
-
-    from mktscan.database import TradeJournalEntry
-    from mktscan.trade_journal import (
-        close_trade, create_trade, iv_bucket, mark_trade, score_bucket, trade_metrics,
-    )
-    from sqlalchemy import select as _tj_select
-
-    _tj_session = get_session()
-    _trades = list(_tj_session.execute(
-        _tj_select(TradeJournalEntry).order_by(TradeJournalEntry.opened_at.desc())
-    ).scalars())
-    _tj_session.close()
-    _open = [t for t in _trades if t.status == "OPEN"]
-    _closed = [t for t in _trades if t.status == "CLOSED"]
-
-    tab_open, tab_log, tab_manage, tab_history, tab_perf, tab_review, tab_risk = st.tabs(
-        ["Open Positions", "Log Trade", "Manage Trade", "Trade History", "Performance", "Trade Review", "Portfolio Risk"]
-    )
-
-    with tab_open:
-        if not _open:
-            st.info("No open journal positions yet.")
-        else:
-            rows = []
-            for t in _open:
-                m = trade_metrics(t, use_current=True)
-                rows.append({
-                    "ID": t.id, "Ticker": t.ticker, "Strategy": t.strategy,
-                    "Opened": t.opened_at, "Qty": t.quantity,
-                    "Entry": t.entry_value, "Current Mark": t.current_value,
-                    "P&L": m.pnl, "ROR %": m.return_on_risk_pct,
-                    "DTE": (t.expiration - date.today()).days if t.expiration else None,
-                    "Tradeability": t.tradeability_score, "Regime": t.regime_label,
-                    "IV Pct": t.iv_percentile,
-                })
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True,
-                         column_config={
-                             "Entry": st.column_config.NumberColumn(format="$%.2f"),
-                             "Current Mark": st.column_config.NumberColumn(format="$%.2f"),
-                             "P&L": st.column_config.NumberColumn(format="$%.2f"),
-                             "ROR %": st.column_config.NumberColumn(format="%.1f%%"),
-                             "Tradeability": st.column_config.NumberColumn(format="%.3f"),
-                             "IV Pct": st.column_config.NumberColumn(format="%.0f"),
-                         })
-            st.caption("Current P&L uses your most recent manual mark. Live option marking can be added later when the real-time options provider is connected.")
-
-    with tab_log:
-        _log_session = get_session()
-        _basket = get_basket(_log_session)
-        _log_session.close()
-        _tickers = [c.ticker for c in _basket]
-        l1, l2, l3 = st.columns(3)
-        with l1:
-            _prefill_ticker = st.session_state.pop("journal_prefill_ticker", None)
-            _ticker_index = _tickers.index(_prefill_ticker) if _prefill_ticker in _tickers else 0
-            _ticker = st.selectbox("Ticker", _tickers, index=_ticker_index, key="journal_new_ticker")
-        with l2:
-            _instrument = st.selectbox("Instrument", ["OPTION", "STOCK"], key="journal_new_instrument")
-        with l3:
-            _direction = st.selectbox("Direction", ["BULLISH", "BEARISH"], key="journal_new_direction")
-
-        option_strategies = ["Long Call", "Long Put", "Bull Call Spread", "Bear Put Spread", "Bull Put Spread", "Bear Call Spread", "Custom Option"]
-        stock_strategies = ["Long Stock", "Short Stock"]
-        with st.form("journal_log_trade", clear_on_submit=False):
-            c1, c2 = st.columns(2)
-            with c1:
-                strategy = st.selectbox("Strategy", option_strategies if _instrument == "OPTION" else stock_strategies)
-                open_date = st.date_input("Entry date", value=date.today())
-                open_time = st.time_input("Entry time", value=datetime.now().time().replace(second=0, microsecond=0))
-                underlying_entry = st.number_input("Underlying entry price", min_value=0.0, value=0.0, step=0.01)
-                quantity = st.number_input("Contracts" if _instrument == "OPTION" else "Shares", min_value=0.01, value=1.0, step=1.0)
-                entry_type = st.selectbox("Entry cash flow", ["DEBIT", "CREDIT"], disabled=(_instrument == "STOCK"))
-                entry_value = st.number_input("Entry premium / price", min_value=0.0, value=0.0, step=0.01,
-                                              help="For an option spread enter the net debit/credit per share. For stock enter the share price.")
-                entry_fees = st.number_input("Entry fees", min_value=0.0, value=0.0, step=0.01)
-            with c2:
-                if _instrument == "OPTION":
-                    expiration = st.date_input("Expiration", value=date.today() + timedelta(days=35))
-                    long_option_type = st.selectbox("Long leg type", ["CALL", "PUT", "NONE"])
-                    long_strike = st.number_input("Long strike", min_value=0.0, value=0.0, step=0.5)
-                    short_option_type = st.selectbox("Short leg type", ["NONE", "CALL", "PUT"])
-                    short_strike = st.number_input("Short strike", min_value=0.0, value=0.0, step=0.5)
-                else:
-                    expiration = None; long_option_type = None; long_strike = 0.0; short_option_type = None; short_strike = 0.0
-                planned_max_loss = st.number_input("Planned max loss ($)", min_value=0.0, value=0.0, step=10.0)
-                planned_exit_date = st.date_input("Planned exit date", value=date.today() + timedelta(days=14))
-                stop_condition = st.text_input("Stop / invalidation", placeholder="e.g. close below support or spread <= $2.50")
-                profit_target = st.text_input("Profit target", placeholder="e.g. 60% of max profit")
-
-            thesis = st.text_area("Trade thesis", placeholder="Why are you taking this trade?")
-            tags = st.text_input("Tags", placeholder="momentum, breakout, low-iv")
-            notes = st.text_area("Notes")
-            submitted = st.form_submit_button("Log Trade", type="primary", use_container_width=True)
-            if submitted:
-                if entry_value <= 0:
-                    st.error("Entry premium / price must be greater than zero.")
-                else:
-                    try:
-                        _s = get_session()
-                        trade = create_trade(
-                            _s, ticker=_ticker, instrument_type=_instrument, direction=_direction,
-                            strategy=strategy, status="OPEN", opened_at=datetime.combine(open_date, open_time),
-                            thesis=thesis or None, tags=tags or None, notes=notes or None,
-                            underlying_entry=underlying_entry or None,
-                            expiration=expiration,
-                            long_option_type=None if long_option_type in (None, "NONE") else long_option_type,
-                            long_strike=long_strike or None,
-                            short_option_type=None if short_option_type in (None, "NONE") else short_option_type,
-                            short_strike=short_strike or None,
-                            quantity=float(quantity), multiplier=100 if _instrument == "OPTION" else 1,
-                            entry_type="DEBIT" if _instrument == "STOCK" else entry_type,
-                            entry_value=float(entry_value), entry_fees=float(entry_fees),
-                            planned_max_loss=planned_max_loss or None,
-                            stop_condition=stop_condition or None, profit_target=profit_target or None,
-                            planned_exit_date=planned_exit_date, current_value=float(entry_value), marked_at=datetime.utcnow(),
-                        )
-                        _s.close()
-                        st.success(f"Logged trade #{trade.id} · {trade.ticker} · {trade.strategy}. MktScan entry context was frozen with the journal record.")
-                        st.cache_data.clear()
-                    except Exception as exc:
-                        st.error(f"Could not log trade: {exc}")
-
-    with tab_manage:
-        if not _open:
-            st.info("No open positions to manage.")
-        else:
-            labels = {f"#{t.id} · {t.ticker} · {t.strategy} · {t.opened_at:%Y-%m-%d}": t.id for t in _open}
-            selected_label = st.selectbox("Open trade", list(labels), key="journal_manage_trade")
-            selected_id = labels[selected_label]
-            t = next(x for x in _open if x.id == selected_id)
-            m = trade_metrics(t, use_current=True)
-            a,b,c,d = st.columns(4)
-            a.metric("Entry", f"${t.entry_value:.2f}")
-            b.metric("Current mark", f"${t.current_value:.2f}" if t.current_value is not None else "—")
-            c.metric("Open P&L", f"${m.pnl:,.2f}" if m.pnl is not None else "—")
-            d.metric("Open ROR", f"{m.return_on_risk_pct:.1f}%" if m.return_on_risk_pct is not None else "—")
-
-            mtab, ctab = st.tabs(["Update Mark", "Close Trade"])
-            with mtab:
-                with st.form("journal_mark_form"):
-                    new_mark = st.number_input("Current option/spread value or stock price", min_value=0.0,
-                                               value=float(t.current_value if t.current_value is not None else t.entry_value), step=0.01)
-                    if st.form_submit_button("Save Mark"):
-                        _s = get_session(); obj = _s.get(TradeJournalEntry, selected_id)
-                        mark_trade(_s, obj, new_mark); _s.close()
-                        st.success("Current mark updated. Refresh the page to see the updated open-position metrics.")
-            with ctab:
-                with st.form("journal_close_form"):
-                    close_date = st.date_input("Exit date", value=date.today(), key="tj_close_date")
-                    close_time = st.time_input("Exit time", value=datetime.now().time().replace(second=0, microsecond=0), key="tj_close_time")
-                    underlying_exit = st.number_input("Underlying exit price", min_value=0.0, value=0.0, step=0.01)
-                    exit_value = st.number_input("Exit premium / price", min_value=0.0,
-                                                 value=float(t.current_value if t.current_value is not None else t.entry_value), step=0.01)
-                    exit_fees = st.number_input("Exit fees", min_value=0.0, value=0.0, step=0.01)
-                    exit_reason = st.selectbox("Exit reason", ["Profit target", "Stop loss", "Signal reversal", "Technical invalidation", "Time exit", "Pre-earnings exit", "Manual discretion", "Expiration", "Assignment", "Other"])
-                    close_notes = st.text_area("Closing notes", value=t.notes or "")
-                    if st.form_submit_button("Close Trade", type="primary"):
-                        _s = get_session(); obj = _s.get(TradeJournalEntry, selected_id)
-                        closed = close_trade(_s, obj, closed_at=datetime.combine(close_date, close_time),
-                                             underlying_exit=underlying_exit or None, exit_value=exit_value,
-                                             exit_fees=exit_fees, exit_reason=exit_reason, notes=close_notes)
-                        _s.close()
-                        st.success(f"Closed trade #{closed.id}: P&L ${closed.realized_pnl:,.2f} · ROR {closed.return_on_risk_pct:.1f}%" if closed.return_on_risk_pct is not None else f"Closed trade #{closed.id}: P&L ${closed.realized_pnl:,.2f}")
-                        st.cache_data.clear()
-
-    with tab_history:
-        if not _trades:
-            st.info("No journal history yet.")
-        else:
-            f1,f2,f3,f4 = st.columns(4)
-            tick_opts = ["All"] + sorted({t.ticker for t in _trades})
-            strat_opts = ["All"] + sorted({t.strategy for t in _trades})
-            with f1: ft = st.selectbox("Ticker", tick_opts, key="tj_hist_ticker")
-            with f2: fs = st.selectbox("Strategy", strat_opts, key="tj_hist_strategy")
-            with f3: fstatus = st.selectbox("Status", ["All", "OPEN", "CLOSED"], key="tj_hist_status")
-            with f4: fresult = st.selectbox("Result", ["All", "Winners", "Losers"], key="tj_hist_result")
-            hist = []
-            for t in _trades:
-                if ft != "All" and t.ticker != ft: continue
-                if fs != "All" and t.strategy != fs: continue
-                if fstatus != "All" and t.status != fstatus: continue
-                m = trade_metrics(t, use_current=(t.status == "OPEN"))
-                if fresult == "Winners" and (m.pnl is None or m.pnl <= 0): continue
-                if fresult == "Losers" and (m.pnl is None or m.pnl >= 0): continue
-                hist.append({"ID":t.id,"Opened":t.opened_at,"Closed":t.closed_at,"Ticker":t.ticker,"Strategy":t.strategy,"Status":t.status,
-                             "P&L":m.pnl,"ROR %":m.return_on_risk_pct,"Hold d":m.holding_days,"Score":t.tradeability_score,
-                             "Regime":t.regime_label,"IV Pct":t.iv_percentile,"Exit Reason":t.exit_reason,"Tags":t.tags})
-            st.dataframe(pd.DataFrame(hist), use_container_width=True, hide_index=True,
-                         column_config={"P&L":st.column_config.NumberColumn(format="$%.2f"),"ROR %":st.column_config.NumberColumn(format="%.1f%%"),"Score":st.column_config.NumberColumn(format="%.3f"),"IV Pct":st.column_config.NumberColumn(format="%.0f")})
-
-            if hist:
-                ids = {f"#{row['ID']} · {row['Ticker']} · {row['Strategy']}": row['ID'] for row in hist}
-                detail_label = st.selectbox("Trade detail", list(ids), key="tj_detail")
-                dtrade = next(t for t in _trades if t.id == ids[detail_label])
-                with st.expander("Entry snapshot", expanded=True):
-                    q1,q2,q3,q4 = st.columns(4)
-                    q1.metric("Tradeability", f"{dtrade.tradeability_score:+.3f}" if dtrade.tradeability_score is not None else "—")
-                    q2.metric("Regime", dtrade.regime_label or "—")
-                    q3.metric("IV Percentile", f"{dtrade.iv_percentile:.0f}" if dtrade.iv_percentile is not None else "—")
-                    q4.metric("Expected Move", f"±{dtrade.expected_move_pct:.1f}%" if dtrade.expected_move_pct is not None else "—")
-                    st.caption(f"IV source: {dtrade.options_source or '—'} · IV Rank: {dtrade.iv_rank if dtrade.iv_rank is not None else '—'} · Put skew: {dtrade.put_skew if dtrade.put_skew is not None else '—'} · Call skew: {dtrade.call_skew if dtrade.call_skew is not None else '—'}")
-                    if dtrade.thesis: st.markdown(f"**Thesis:** {dtrade.thesis}")
-                    if dtrade.notes: st.markdown(f"**Notes:** {dtrade.notes}")
-
-    with tab_perf:
-        if not _closed:
-            st.info("Close at least one trade to populate performance analytics.")
-        else:
-            pdata = []
-            for t in _closed:
-                m = trade_metrics(t)
-                if m.pnl is None: continue
-                pdata.append({"id":t.id,"date":t.closed_at,"ticker":t.ticker,"strategy":t.strategy,"pnl":m.pnl,"ror":m.return_on_risk_pct,
-                              "regime":t.regime_label or "Unknown","iv_bucket":iv_bucket(t.iv_percentile),"score_bucket":score_bucket(t.tradeability_score),"exit_reason":t.exit_reason or "Unknown"})
-            pdf = pd.DataFrame(pdata)
-            if pdf.empty:
-                st.info("Closed trades do not yet have enough pricing data for performance calculations.")
-            else:
-                wins = pdf[pdf.pnl > 0]; losses = pdf[pdf.pnl < 0]
-                total = float(pdf.pnl.sum()); n=len(pdf); wr=len(wins)/n*100 if n else 0
-                avg_win=float(wins.pnl.mean()) if len(wins) else 0; avg_loss=float(losses.pnl.mean()) if len(losses) else 0
-                gross_win=float(wins.pnl.sum()); gross_loss=abs(float(losses.pnl.sum()))
-                pf=gross_win/gross_loss if gross_loss>0 else None
-                expectancy=float(pdf.pnl.mean())
-                avg_ror=float(pdf.ror.dropna().mean()) if pdf.ror.notna().any() else None
-                k1,k2,k3,k4,k5,k6 = st.columns(6)
-                k1.metric("Net P&L", f"${total:,.0f}")
-                k2.metric("Closed Trades", f"{n}")
-                k3.metric("Win Rate", f"{wr:.1f}%")
-                k4.metric("Profit Factor", f"{pf:.2f}" if pf is not None else "—")
-                k5.metric("Expectancy", f"${expectancy:,.0f}/trade")
-                k6.metric("Avg ROR", f"{avg_ror:.1f}%" if avg_ror is not None else "—")
-                st.caption(f"Average winner ${avg_win:,.0f} · Average loser ${avg_loss:,.0f}")
-
-                curve = pdf.sort_values("date").copy(); curve["Equity P&L"] = curve.pnl.cumsum()
-                st.plotly_chart(px.line(curve, x="date", y="Equity P&L", markers=True, title="Cumulative Realized P&L"), use_container_width=True)
-
-                st.subheader("Performance Attribution")
-                for title, col in [("By Strategy","strategy"),("By Market Regime","regime"),("By IV Percentile","iv_bucket"),("By Tradeability Magnitude","score_bucket"),("By Exit Reason","exit_reason")]:
-                    with st.expander(title, expanded=(col in {"strategy","regime"})):
-                        grp = pdf.groupby(col, dropna=False).agg(Trades=("pnl","size"), Net_PnL=("pnl","sum"), Avg_PnL=("pnl","mean"), Win_Rate=("pnl",lambda x:(x>0).mean()*100), Avg_ROR=("ror","mean")).reset_index()
-                        st.dataframe(grp, use_container_width=True, hide_index=True,
-                                     column_config={"Net_PnL":st.column_config.NumberColumn("Net P&L",format="$%.2f"),"Avg_PnL":st.column_config.NumberColumn("Avg P&L",format="$%.2f"),"Win_Rate":st.column_config.NumberColumn("Win Rate",format="%.1f%%"),"Avg_ROR":st.column_config.NumberColumn("Avg ROR",format="%.1f%%")})
-
-
-    with tab_review:
-        st.subheader("Model vs Trader Attribution")
-        st.caption("Separates directional thesis quality from trade-structure/execution outcome using closed journal trades.")
-        if not _closed:
-            st.info("Close at least one trade to review attribution.")
-        else:
-            review_rows=[]
-            for t in _closed:
-                underlying_move=None
-                if t.underlying_entry and t.underlying_exit:
-                    underlying_move=(float(t.underlying_exit)/float(t.underlying_entry)-1)*100
-                thesis_correct=None
-                if underlying_move is not None:
-                    thesis_correct=(underlying_move>0) if t.direction=="BULLISH" else (underlying_move<0)
-                pnl=float(t.realized_pnl or 0)
-                if thesis_correct is True and pnl>0: diagnosis="MODEL + STRUCTURE WORKED"
-                elif thesis_correct is True and pnl<=0: diagnosis="STRUCTURE / EXECUTION ERROR"
-                elif thesis_correct is False and pnl<=0: diagnosis="DIRECTIONAL THESIS ERROR"
-                elif thesis_correct is False and pnl>0: diagnosis="P&L POSITIVE DESPITE THESIS"
-                else: diagnosis="NEEDS UNDERLYING EXIT"
-                review_rows.append({"ID":t.id,"Ticker":t.ticker,"Strategy":t.strategy,"Underlying Move %":underlying_move,"P&L":pnl,"ROR %":t.return_on_risk_pct,"Diagnosis":diagnosis,"Exit Reason":t.exit_reason})
-            rdf=pd.DataFrame(review_rows)
-            st.dataframe(rdf,use_container_width=True,hide_index=True,column_config={"Underlying Move %":st.column_config.NumberColumn(format="%+.1f%%"),"P&L":st.column_config.NumberColumn(format="$%.2f"),"ROR %":st.column_config.NumberColumn(format="%+.1f%%")})
-            diag=rdf.groupby('Diagnosis').agg(Trades=('ID','size'),Net_PnL=('P&L','sum')).reset_index()
-            st.dataframe(diag,use_container_width=True,hide_index=True,column_config={"Net_PnL":st.column_config.NumberColumn("Net P&L",format="$%.2f")})
-
-    with tab_risk:
-        st.subheader("Portfolio Risk")
-        st.caption("Risk and concentration from open journal positions. Greeks require live option marking/contract Greeks and are intentionally not estimated here.")
-        if not _open:
-            st.info("No open positions to analyze.")
-        else:
-            risk_rows=[]
-            total_risk=0.0
-            for t in _open:
-                risk=float(t.planned_max_loss or 0)
-                if risk<=0 and t.entry_type=="DEBIT": risk=float(t.entry_value or 0)*float(t.quantity or 1)*float(t.multiplier or 1)
-                total_risk+=risk
-                signed=risk if t.direction=="BULLISH" else -risk
-                risk_rows.append({"Ticker":t.ticker,"Strategy":t.strategy,"Direction":t.direction,"Risk $":risk,"Signed Risk $":signed,"Regime":t.regime_label or 'Unknown'})
-            rr=pd.DataFrame(risk_rows)
-            by=rr.groupby('Ticker').agg(Positions=('Ticker','size'),Risk=('Risk $','sum'),Net_Directional_Risk=('Signed Risk $','sum')).reset_index().sort_values('Risk',ascending=False)
-            by['Share %']=by['Risk']/total_risk*100 if total_risk else 0
-            p1,p2,p3=st.columns(3); p1.metric("Capital at Risk",f"${total_risk:,.0f}"); p2.metric("Open Positions",len(_open)); p3.metric("Largest Ticker",f"{by.iloc[0]['Ticker']} · {by.iloc[0]['Share %']:.0f}%" if not by.empty else '—')
-            st.dataframe(by,use_container_width=True,hide_index=True,column_config={"Risk":st.column_config.NumberColumn("Risk $",format="$%.0f"),"Net_Directional_Risk":st.column_config.NumberColumn("Directional $",format="$%+.0f"),"Share %":st.column_config.ProgressColumn(min_value=0,max_value=100,format="%.0f%%")})
-            if not by.empty and by.iloc[0]['Share %']>=35: st.warning(f"Concentration: {by.iloc[0]['Ticker']} represents {by.iloc[0]['Share %']:.0f}% of recorded open risk.")
-            bull=rr.loc[rr['Signed Risk $']>0,'Risk $'].sum(); bear=rr.loc[rr['Signed Risk $']<0,'Risk $'].sum()
-            st.caption(f"Bullish risk ${bull:,.0f} · Bearish risk ${bear:,.0f}. Add live Greeks later for true delta/gamma/theta/vega aggregation.")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# BACKTEST PAGE
-# ═══════════════════════════════════════════════════════════════════════════════
-elif page == "Backtest":
-    st.title("Score Accuracy Backtest")
-    st.caption(
-        "Measures whether the tradeability score correctly predicted the direction "
-        "of price returns over 5, 10, 21, and 63 trading days. "
-        "Uses price momentum, technical, and volume signals — the three signals "
-        "that can be reconstructed from historical OHLCV data. "
-        "Runs incrementally: the first run pulls 5 years of history; "
-        "subsequent runs only fetch new data since the last update."
-    )
-
-    from mktscan.backtest_incremental import (
-        run_incremental_backtest, get_summary, get_total_observations,
-        BacktestObservation,
-    )
-    from sqlalchemy import select as _select
-
-    session_bt = get_session()
-    total_obs  = get_total_observations(session_bt)
-    summary    = get_summary(session_bt)
-    session_bt.close()
-
-    # ── Status + run button ───────────────────────────────────────────────────
-    status_col, btn_col = st.columns([3, 1])
-
-    with status_col:
-        if total_obs == 0:
-            st.info(
-                "No backtest data yet. Click **Run Backtest** to pull 5 years of "
-                "historical data and compute signal accuracy. Takes 2–5 minutes on first run."
-            )
-        else:
-            last_updated = summary[0]["updated_at"] if summary else None
-            last_str = last_updated.strftime("%b %d, %Y at %H:%M UTC") if last_updated else "—"
-            st.success(
-                f"**{total_obs:,} observations** stored across your basket.  "
-                f"Last updated: {last_str}.  "
-                f"Updates automatically every Sunday at 02:00 UTC."
-            )
-
-    with btn_col:
-        st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-        run_bt = st.button(
-            "▶ Run Backtest",
-            type="primary",
-            use_container_width=True,
-            key="run_backtest_btn",
-        )
-
-    if run_bt:
-        from mktscan.backtest_incremental import run_incremental_backtest
-        bt_log   = st.empty()
-        bt_lines: list[str] = []
-
-        def _bt_cb(level: str, msg: str):
-            bt_lines.append(f"· {msg}")
-            bt_log.markdown("\n\n".join(bt_lines[-20:]))
-
-        session_bt2 = get_session()
-        basket_bt   = get_basket(session_bt2)
-        tickers_bt  = [c.ticker for c in basket_bt]
-
-        with st.spinner("Running backtest…"):
-            try:
-                bt_result = run_incremental_backtest(
-                    session=session_bt2,
-                    tickers=tickers_bt,
-                    progress_cb=_bt_cb,
-                )
-                st.success(
-                    f"✅ Backtest complete — "
-                    f"{bt_result['new_observations']} new observations, "
-                    f"{bt_result['tickers_processed']} tickers processed"
-                )
-                session_bt2.close()
-                st.rerun()
-            except Exception as bt_err:
-                st.error(f"Backtest failed: {bt_err}")
-                session_bt2.close()
-
-    if not summary:
-        st.stop()
-
-    st.divider()
-
-    # ── Summary tables by holding period ─────────────────────────────────────
-    LABEL_ORDER  = ["STRONG_BUY", "BULLISH", "NEUTRAL", "BEARISH", "STRONG_SELL"]
-    LABEL_COLORS = {
-        "STRONG_BUY":  "#22d3a0",
-        "BULLISH":     "#86efac",
-        "NEUTRAL":     "#fbbf24",
-        "BEARISH":     "#fca5a5",
-        "STRONG_SELL": "#f87171",
-    }
-    HOLDING_LABELS = {5: "5-day", 10: "10-day", 21: "1-month", 63: "1-quarter"}
-
-    holding_periods = sorted({r["holding_days"] for r in summary})
-    tabs = st.tabs([HOLDING_LABELS.get(hp, f"{hp}d") for hp in holding_periods])
-
-    for tab, hp in zip(tabs, holding_periods):
-        with tab:
-            hp_rows = [r for r in summary if r["holding_days"] == hp]
-            hp_map  = {r["label"]: r for r in hp_rows}
-
-            # ── KPI strip ─────────────────────────────────────────────────
-            sb_data  = hp_map.get("STRONG_BUY", {})
-            bull_data = hp_map.get("BULLISH", {})
-            bear_data = hp_map.get("BEARISH", {})
-
-            k1, k2, k3, k4, k5 = st.columns(5)
-            k1.metric(
-                "Strong Buy win rate",
-                f"{sb_data.get('win_rate_pct', 0):.1f}%" if sb_data else "—",
-                delta=(f"{sb_data['win_rate_pct'] - sb_data['benchmark_win_rate_pct']:+.1f} vs benchmark"
-                       if sb_data.get("benchmark_win_rate_pct") is not None else None),
-                help="% of STRONG_BUY signals followed by a positive return.",
-            )
-            k2.metric(
-                "Strong Buy avg return",
-                f"{sb_data.get('avg_return_pct', 0):+.2f}%" if sb_data else "—",
-            )
-            # The number that actually matters. A 55% win rate is not an edge if
-            # the universe rose on 55% of days regardless — the previous version
-            # reported the raw rate with nothing to compare it against.
-            k3.metric(
-                "Excess vs buy-and-hold",
-                f"{sb_data.get('excess_return_pct', 0):+.2f}%" if sb_data.get("excess_return_pct") is not None else "—",
-                help="Average return on STRONG_BUY signals minus the unconditional "
-                     "average across all observations. This is the only figure here "
-                     "that says whether the signal added anything.",
-            )
-            k4.metric(
-                "Option P&L (21d spread)",
-                f"{sb_data.get('option_avg_pnl_pct', 0):+.1f}%" if sb_data.get("option_avg_pnl_pct") is not None else "—",
-                help="Simulated return on capital at risk for the debit spread the "
-                     "strategy layer would have selected, net of an assumed 4% "
-                     "round-trip spread cost. Uses realised vol as the IV estimate.",
-            )
-            k5.metric(
-                "Total observations",
-                f"{sum(r['n_observations'] for r in hp_rows):,}",
-            )
-
-            st.caption(
-                "Reconstructed from price history using the production signal "
-                "functions. Categories that need live data (news sentiment, analyst "
-                "targets, short interest) cannot be rebuilt historically, so each "
-                "observation records the fraction of model weight that was actually "
-                "available — see the coverage column."
-            )
-
-            st.divider()
-
-            # ── Bar chart: avg return by label ────────────────────────────
-            chart_labels  = [l for l in LABEL_ORDER if l in hp_map]
-            chart_returns = [hp_map[l]["avg_return_pct"] for l in chart_labels]
-            chart_colors  = [LABEL_COLORS[l] for l in chart_labels]
-
-            fig_bt = go.Figure(go.Bar(
-                x=chart_labels,
-                y=chart_returns,
-                marker_color=chart_colors,
-                text=[f"{r:+.2f}%" for r in chart_returns],
-                textposition="outside",
-                hovertemplate="<b>%{x}</b><br>Avg return: %{y:+.2f}%<extra></extra>",
-            ))
-            fig_bt.add_hline(y=0, line_color="rgba(255,255,255,0.2)", line_width=1)
-            fig_bt.update_layout(
-                height=280,
-                margin=dict(l=10, r=10, t=30, b=10),
-                title=dict(
-                    text=f"Average {HOLDING_LABELS.get(hp, f'{hp}d')} return by score label",
-                    font=dict(size=12, family="IBM Plex Mono", color="#94a3b8"),
-                ),
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(0,0,0,0)",
-                font=dict(family="IBM Plex Mono", color="#94a3b8"),
-                xaxis=dict(gridcolor="rgba(255,255,255,0.05)"),
-                yaxis=dict(
-                    gridcolor="rgba(255,255,255,0.05)",
-                    ticksuffix="%",
-                    zeroline=False,
-                ),
-                showlegend=False,
-            )
-            st.plotly_chart(fig_bt, use_container_width=True)
-
-            # ── Detail table ──────────────────────────────────────────────
-            st.markdown("**Full breakdown**")
-            table_rows = []
-            for label in LABEL_ORDER:
-                r = hp_map.get(label)
-                if not r:
-                    continue
-                wr = r["win_rate_pct"]
-                ar = r["avg_return_pct"]
-                sh = r["sharpe"]
-                excess = r.get("excess_return_pct")
-                n = r["n_observations"]
-
-                # Edge is judged against the benchmark, not against zero, and it
-                # requires a sample large enough to mean anything. The previous
-                # rule ("win rate > 52%") called a signal an edge in any rising
-                # market, on any sample size.
-                if excess is None or n < 100:
-                    edge = "— Insufficient data"
-                elif label in ("STRONG_BUY", "BULLISH"):
-                    edge = ("✅ Edge" if excess > 0.5 else
-                            "⚠️ Marginal" if excess > 0 else "❌ No edge")
-                elif label in ("BEARISH", "STRONG_SELL"):
-                    edge = ("✅ Edge" if excess < -0.5 else
-                            "⚠️ Marginal" if excess < 0 else "❌ No edge")
-                else:
-                    edge = "— Neutral"
-
-                table_rows.append({
-                    "Label":        label,
-                    "Obs":          n,
-                    "Avg Return":   f"{ar:+.2f}%",
-                    "Benchmark":    (f"{r['benchmark_avg_return_pct']:+.2f}%"
-                                     if r.get("benchmark_avg_return_pct") is not None else "—"),
-                    "Excess":       f"{excess:+.2f}%" if excess is not None else "—",
-                    "Win Rate":     f"{wr:.1f}%",
-                    "Sharpe":       f"{sh:.2f}",
-                    "Option P&L":   (f"{r['option_avg_pnl_pct']:+.1f}%"
-                                     if r.get("option_avg_pnl_pct") is not None else "—"),
-                    "Opt Win":      (f"{r['option_win_rate']:.0f}%"
-                                     if r.get("option_win_rate") is not None else "—"),
-                    "Best":         f"{r['best_return_pct']:+.2f}%",
-                    "Worst":        f"{r['worst_return_pct']:+.2f}%",
-                    "Edge":         edge,
-                })
-            st.dataframe(
-                pd.DataFrame(table_rows),
-                use_container_width=True,
-                hide_index=True,
-            )
-
-    st.divider()
-
-    # ── Interpretation guide ──────────────────────────────────────────────────
-    st.markdown("**How to interpret these results**")
-    st.markdown(
-        '<div style="font-size:13px;color:#94a3b8;line-height:1.8;padding:14px 18px;'
-        'border-radius:8px;background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.07)">'
-        '<b style="color:#e2e8f0">Monotonicity</b> — the most important signal. '
-        'A well-calibrated system shows: STRONG_BUY > BULLISH > NEUTRAL > BEARISH > STRONG_SELL '
-        'in average return. If this ordering breaks down, the weights need recalibration.<br><br>'
-        '<b style="color:#e2e8f0">Win Rate</b> — above 52% for STRONG_BUY/BULLISH is meaningful. '
-        'Markets are roughly 50/50 in the short term so any consistent edge above 52% is real.<br><br>'
-        '<b style="color:#e2e8f0">Sharpe above 0.5</b> — indicates risk-adjusted edge. '
-        'Above 1.0 is strong. Below 0 means the signal is destructive on a risk-adjusted basis.<br><br>'
-        '<b style="color:#e2e8f0">Note</b> — this backtest uses only price-based signals '
-        '(momentum, technical, volume). The full tradeability score also includes sentiment, '
-        'fundamentals, and earnings signals which cannot be reconstructed historically for free. '
-        'Real performance may differ.'
-        '</div>',
-        unsafe_allow_html=True,
-    )
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# DATA DEFINITIONS PAGE
-# ═══════════════════════════════════════════════════════════════════════════════
-elif page == "Data Definitions":
-    st.title("Data Definitions")
-    st.caption("A complete reference for every metric, signal, and score used in MktScan.")
-
-    CAT_COLORS_DEF = {
-        "sentiment":      "#60a5fa",
-        "technical":      "#22d3a0",
-        "price_momentum": "#34d399",
-        "fundamental":    "#a78bfa",
-        "event_driven":   "#f87171",
-    }
-
-    # ── Section: Tradeability Score ───────────────────────────────────────────
-    st.markdown(
-        '<div style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);'
-        'border-radius:10px;padding:20px 24px;margin-bottom:24px">'
-        '<div style="font-family:IBM Plex Mono,monospace;font-size:11px;color:#64748b;'
-        'text-transform:uppercase;letter-spacing:0.08em;margin-bottom:8px">Overview</div>'
-        '<div style="font-size:22px;font-weight:600;color:#e2e8f0;margin-bottom:10px">'
-        'Tradeability Score</div>'
-        '<div style="color:#94a3b8;line-height:1.7;font-size:14px">'
-        'A composite score from <b style="color:#e2e8f0">-1.0</b> to <b style="color:#e2e8f0">+1.0</b> '
-        'designed to surface the strongest options trading candidates from your basket. '
-        'It combines five independently weighted signal categories — each measuring a different '
-        'dimension of tradeable opportunity. The final score is a confidence-adjusted weighted '
-        'average: categories with thin data (few articles, no price history) automatically '
-        'contribute less so they do not distort the result.'
-        '</div>'
-        '</div>',
-        unsafe_allow_html=True,
-    )
-
-    # Score scale
-    st.markdown("#### Score interpretation")
-    scale_items = [
-        ("> +0.50", "STRONG BUY",  "#22d3a0", "Strong positive signal across multiple categories. High-conviction bullish trade candidate."),
-        ("+0.20 to +0.50", "BULLISH", "#86efac", "Moderate positive lean. Worth watching — confirm with your own chart analysis."),
-        ("-0.20 to +0.20", "NEUTRAL", "#fbbf24", "No clear directional edge. Signals are mixed or data is thin."),
-        ("-0.50 to -0.20", "BEARISH", "#fca5a5", "Moderate negative lean. Caution advised — consider defensive or bearish strategies."),
-        ("< -0.50", "STRONG SELL", "#f87171", "Strong negative signal. Avoid long exposure or consider put strategies."),
-    ]
-    for score_range, label, color, desc in scale_items:
-        st.markdown(
-            f'<div style="display:flex;align-items:flex-start;gap:16px;padding:10px 14px;'
-            f'margin-bottom:6px;border-radius:6px;background:rgba(255,255,255,0.02);'
-            f'border-left:3px solid {color}">'
-            f'<div style="min-width:110px;font-family:IBM Plex Mono,monospace;font-size:12px;'
-            f'color:{color};font-weight:600;padding-top:1px">{score_range}</div>'
-            f'<div style="min-width:100px;font-family:IBM Plex Mono,monospace;font-size:12px;'
-            f'color:{color};font-weight:600;padding-top:1px">{label}</div>'
-            f'<div style="font-size:13px;color:#94a3b8;line-height:1.5">{desc}</div>'
-            f'</div>',
-            unsafe_allow_html=True,
-        )
-
-    st.divider()
-
-    # ── Five categories ───────────────────────────────────────────────────────
-    st.markdown("#### Signal categories")
-    st.caption("Each category produces its own sub-score in [-1, +1] then feeds into the weighted composite.")
-
-    CATEGORIES = [
-        {
-            "key":     "sentiment",
-            "label":   "📰 Sentiment Signals",
-            "weight":  "Default 30%",
-            "color":   "#60a5fa",
-            "summary": (
-                "A unified sentiment signal combining raw news score, confidence adjustment, "
-                "sentiment momentum, source diversity, and recency weighting — all in one category."
-            ),
-            "how": (
-                "Five sub-signals are computed and combined with individual weights: "
-                "(1) Raw score (1.5×) — VADER/FinBERT weighted avg across all articles, quality-weighted by source. "
-                "(2) Confidence adjustment — raw score is discounted when fewer than 15 articles were found. "
-                "(3) Sentiment momentum (1.0×) — compares latest score to oldest score in a 3-run window. "
-                "A rising trend = positive momentum. "
-                "(4) Source diversity (0.4×) — rewards coverage confirmed across multiple outlets. "
-                "1 source = 0 bonus, 4+ sources = max. "
-                "(5) Recency-weighted score (1.2×) — re-scores articles with exponential time decay "
-                "(48h half-life) so today's news dominates week-old articles."
-            ),
-            "components": [
-                ("Raw sentiment (conf-adjusted)", "VADER/FinBERT avg across articles × (0.4 + 0.6 × confidence). "
-                 "Confidence = min(1.0, article_count / 15). Weight: 1.5×."),
-                ("Sentiment momentum", "Latest score − oldest score in 3-run window, scaled × 2.5. "
-                 "Positive = improving trend. Requires 2+ prior scraper runs. Weight: 1.0×."),
-                ("Source diversity", "Fraction of possible sources contributing articles. "
-                 "Rewards breadth over single-source stories. Caps at +0.5 contribution. Weight: 0.4×."),
-                ("Recency-weighted score", "Exponential decay: articles from 2h ago = 98% weight, "
-                 "48h ago = 50%, 1 week ago = 8%. Ensures today's news leads. Weight: 1.2×."),
-            ],
-            "interpret": (
-                "A high combined sentiment score means recent coverage is broadly positive AND improving "
-                "across multiple sources AND confirmed by recent articles. This is a stronger signal than "
-                "raw sentiment alone. Watch the momentum sub-component — a rising trend on previously "
-                "neutral coverage often precedes a price catalyst. "
-                "A falling recency-weighted score while the raw score stays high means the most recent "
-                "articles are turning negative — an early warning to re-evaluate the position."
-            ),
-            "caveats": [
-                "VADER struggles with financial jargon. Switch to FinBERT in config.yaml for meaningfully better accuracy on this basket.",
-                "Momentum requires 2+ prior scraper runs. Shows 0.0 on the first run.",
-                "Positive sentiment ≠ price will go up. Markets are forward-looking and often price in news before it hits articles.",
-                "Diversity bonus can be gamed by the same story being republished across many outlets — cross-reference with article headlines.",
-            ],
-        },
-        {
-            "key":     "technical",
-            "label":   "📈 Technical Signals",
-            "weight":  "Default 25%",
-            "color":   "#22d3a0",
-            "summary": "Derives trading signals from price data — where the stock sits in its range, momentum, and analyst consensus.",
-            "how": (
-                "Four sub-components are computed from the latest price snapshot fetched from Yahoo Finance. "
-                "Each is normalised to [-1, +1] and combined with different weights: "
-                "52-week position (1.2×), day momentum (0.6×), analyst rating (1.0×), breakout proximity (0.8×). "
-                "The weighted average becomes the technical score."
-            ),
-            "components": [
-                ("52-week range position", "Where is the current price within its 52-week high/low band? "
-                 "At the 52w high = +1.0 (bullish momentum), at the 52w low = -1.0 (bearish). "
-                 "Formula: ((price − 52w_low) / (52w_high − 52w_low) − 0.5) × 2"),
-                ("Day momentum", "Today's % price change, clamped at ±5%. "
-                 "+5% day = +1.0, -5% day = -1.0. Lower weight (0.6×) as single-day moves are noisy."),
-                ("Analyst consensus", "Maps the analyst rating string to a score: "
-                 "Strong Buy=+1.0, Buy=+0.6, Outperform=+0.5, Hold=0.0, Underperform=-0.5, Sell=-0.8, Strong Sell=-1.0."),
-                ("Breakout proximity", "How close is the price to the 52-week high? "
-                 "Within 2% = +0.7 (potential breakout), within 10% = +0.3, more than 20% below = 0.0."),
-            ],
-            "interpret": (
-                "High technical scores favour momentum-based options strategies — buying calls when a stock "
-                "is near its 52w high with analyst support. Low scores suggest the stock is in a downtrend "
-                "or under distribution. A neutral analyst rating with a strong 52w position can still "
-                "produce a high technical score — the price action is leading analyst opinions."
-            ),
-            "caveats": [
-                "Uses end-of-day price data, not intraday. Run the scraper during market hours for fresher data.",
-                "Day momentum (0.6× weight) is intentionally underweighted — single-day moves are mean-reverting.",
-                "Analyst ratings lag price action by weeks. Use as confirmation, not a leading indicator.",
-            ],
-        },
-        {
-            "key":     "price_momentum",
-            "label":   "📉 Price Momentum",
-            "weight":  "Default 20%",
-            "color":   "#34d399",
-            "summary": "Quantifies the quality and direction of recent price movement using rolling 14-day daily returns fetched live from Yahoo Finance.",
-            "how": (
-                "Five sub-components are computed from the last 14 trading days of daily % returns "
-                "fetched live from Yahoo Finance each time the Tradeability page loads. "
-                "RSI is weighted highest (1.5x) as the most reliable momentum signal. "
-                "Trend slope (1.2x), acceleration (1.0x), streak (0.9x), and volatility regime (0.8x) "
-                "are combined into a weighted average score in [-1, +1]."
-            ),
-            "components": [
-                ("RSI (14-day)", "Relative Strength Index over the 14-day window. "
-                 "Measures average gains vs average losses. "
-                 "Score mapping: RSI < 25 = +0.8 (oversold/bullish), 25-40 = +0.4, 40-60 = 0.0 (neutral), "
-                 "60-70 = +0.4 (bullish momentum), 70-80 = +0.1 (overbought but still trending), >80 = -0.3 (mean reversion risk). "
-                 "Weighted 1.5x — highest weight in this category."),
-                ("Trend direction", "Ordinary least squares slope fit across the 14 daily returns. "
-                 "A rising slope means returns are getting more positive over the window (building momentum). "
-                 "Normalised: slope of +0.5%/day = +1.0, -0.5%/day = -1.0. Weighted 1.2x."),
-                ("Annualised volatility", "Standard deviation of the 14 daily returns, annualised by multiplying by sqrt(252). "
-                 "Low vol (<20%) = calm, tradeable environment (+0.3). "
-                 "Mid vol (20-35%) = normal (+0.1). High vol (35-55%) = uncertain (-0.1). "
-                 "Very high vol (>55%) = chaotic (-0.4). Weighted 0.8x."),
-                ("Consecutive day streak", "How many trading days in a row has the stock moved in the same direction? "
-                 "3+ up days = +0.4, 4+ = +0.6, 5+ = +0.7. Same in reverse for down days. "
-                 "1-2 day streaks score near zero — too short to be meaningful. Weighted 0.9x."),
-                ("5-day vs 14-day acceleration", "Compares the average daily return of the last 5 days against the full 14-day average. "
-                 "Positive acceleration (recent days stronger) = momentum building (+). "
-                 "Negative (recent days weaker) = momentum fading (-). Weighted 1.0x."),
-            ],
-            "interpret": (
-                "High price momentum scores favour trend-following strategies — buying calls on stocks "
-                "with RSI in the 55-70 range (bullish but not overbought), rising trend slope, and "
-                "accelerating recent returns. Avoid chasing RSI > 80 — that is when mean reversion "
-                "risk is highest and call premium is expensive. "
-                "Low momentum (negative trend, high vol) suggests the stock is in a distribution phase "
-                "— better candidates for put strategies or staying in cash. "
-                "The streak component catches short-term momentum setups: 4+ consecutive up days with "
-                "rising volume is a classic breakout confirmation signal."
-            ),
-            "caveats": [
-                "Uses 14 trading days (~3 calendar weeks) — a short window that is sensitive to recent events. One earnings-day spike can dominate the signal.",
-                "RSI at these timeframes is noisier than the traditional 14-week RSI used in charting. Use as one input, not a standalone trigger.",
-                "Fetched live from Yahoo Finance on page load — if Yahoo is unavailable, the score defaults to 0.0 with zero confidence.",
-                "Annualised vol from 14 days understates true vol for infrequently-moving stocks. Use the volatility reading directionally, not as an absolute measure.",
-            ],
-        },
-        {
-            "key":     "fundamental",
-            "label":   "📊 Fundamental Signals",
-            "weight":  "Default 15%",
-            "color":   "#a78bfa",
-            "summary": "Scores the company's valuation and earnings quality — P/E ratio, earnings surprise history, and beat consistency.",
-            "how": (
-                "Three sub-components from price snapshots and historical earnings data. "
-                "Earnings surprise (1.2×) is slightly overweighted as consistent beats are a strong quality signal. "
-                "Beat streak (0.8×) rewards consistency. P/E (1.0×) penalises stretched valuations."
-            ),
-            "components": [
-                ("P/E ratio band", "Maps trailing P/E to a score based on value thresholds: "
-                 "P/E < 15 = +0.6 (cheap), 15–25 = +0.2, 25–35 = 0.0 (fair), 35–50 = -0.3, 50–70 = -0.6, >70 = -0.9 (stretched). "
-                 "Note: high-growth tech tends to have elevated P/E — consider adjusting your Fundamental weight down for this sector."),
-                ("Avg earnings surprise", "Average EPS surprise % across the last 4 reported quarters. "
-                 "Normalised so +10% avg surprise = +1.0, -10% = -1.0. "
-                 "Formula: clamp(avg_surprise / 10.0, -1, +1)"),
-                ("Beat streak", "Fraction of last 4 quarters with a positive EPS surprise. "
-                 "4/4 beats = +1.0, 3/4 = +0.5, 2/4 = 0.0, 1/4 = -0.5, 0/4 = -1.0."),
-            ],
-            "interpret": (
-                "A strong fundamental score means the company is reporting better than expected results "
-                "consistently, which tends to attract institutional buying and support options premiums. "
-                "A low score combined with a high P/E is a warning sign — expensive stock with disappointing "
-                "execution. High growth stocks (NVDA, AMD) will naturally score lower on P/E — reduce the "
-                "Fundamental weight or increase Technical/Event weights for growth-focused portfolios."
-            ),
-            "caveats": [
-                "P/E thresholds are calibrated for broad market — high-growth tech typically trades at 40–80× P/E legitimately.",
-                "Earnings history is only as complete as what the scraper has collected. Run --mode earnings to populate it.",
-                "One massive beat can dominate the avg surprise — look at the beat streak for consistency.",
-            ],
-        },
-
-        {
-            "key":     "event_driven",
-            "label":   "⚡ Event-Driven Signals",
-            "weight":  "Default 15%",
-            "color":   "#f87171",
-            "summary": "Captures near-term catalysts — upcoming earnings, recent results, and price breakout potential.",
-            "how": (
-                "Three sub-components from earnings calendar and price data. "
-                "Earnings proximity and last result have equal 1.0× weight; breakout proximity is 0.6×."
-            ),
-            "components": [
-                ("Earnings proximity", "Days until next scheduled earnings report. "
-                 "1–7 days away = +0.50 (high IV expansion opportunity), 8–21 days = +0.25, >21 days = 0.0. "
-                 "Near-term earnings = elevated implied volatility = richer options premiums."),
-                ("Last earnings result", "Was the most recent report a beat or miss, and by how much? "
-                 "Formula: clamp(surprise_pct / 15.0, -1, +1). "
-                 "+15% EPS beat = +1.0, -15% miss = -1.0. "
-                 "Companies that just beat strongly often exhibit post-earnings drift."),
-                ("Near 52w high breakout", "Is the price close to breaking to new highs? "
-                 "Within 2% of 52w high = +0.70 (breakout candidate), within 10% = +0.30, >20% below = 0.0. "
-                 "Breakouts near all-time highs often accelerate with volume."),
-            ],
-            "interpret": (
-                "The event-driven score is most powerful in the 1–3 weeks before an earnings date. "
-                "A high score here combined with a strong technical score is the classic setup for a "
-                "pre-earnings call buying strategy. After earnings pass, this score resets low until "
-                "the next report date is populated by the scraper. "
-                "The 52w high component adds a breakout filter — the best opportunities often combine "
-                "an upcoming catalyst with a stock already in price discovery."
-            ),
-            "caveats": [
-                "Earnings proximity requires earnings dates in the database — run --mode earnings to populate.",
-                "High event score near earnings means high risk too — IV crush after the report can hurt options buyers.",
-                "Last result uses surprise %, not absolute EPS — a small company beating by $0.01 on $0.02 estimate is +50% surprise.",
-            ],
-        },
-    ]
-
-    for cat in CATEGORIES:
-        color = cat["color"]
-        with st.expander(f"{cat['label']}  ·  {cat['weight']}", expanded=False):
-            # Header strip
-            st.markdown(
-                f'<div style="background:{color}18;border:1px solid {color}33;border-radius:8px;'
-                f'padding:14px 18px;margin-bottom:16px">'
-                f'<div style="font-size:14px;color:#e2e8f0;font-weight:500;margin-bottom:6px">'
-                f'{cat["summary"]}</div>'
-                f'<div style="font-size:12px;color:#64748b;line-height:1.65">{cat["how"]}</div>'
-                f'</div>',
-                unsafe_allow_html=True,
-            )
-
-            # Components table
-            st.markdown("**Sub-components**")
-            for comp_name, comp_desc in cat["components"]:
-                st.markdown(
-                    f'<div style="display:flex;gap:14px;padding:9px 12px;margin-bottom:5px;'
-                    f'border-radius:5px;background:rgba(255,255,255,0.02);'
-                    f'border-left:2px solid {color}66">'
-                    f'<div style="min-width:170px;font-family:IBM Plex Mono,monospace;'
-                    f'font-size:11px;color:{color};font-weight:600;padding-top:1px">{comp_name}</div>'
-                    f'<div style="font-size:12px;color:#94a3b8;line-height:1.55">{comp_desc}</div>'
-                    f'</div>',
-                    unsafe_allow_html=True,
-                )
-
-            st.markdown("<br>", unsafe_allow_html=True)
-
-            # Interpretation
-            st.markdown("**How to interpret it**")
-            st.markdown(
-                f'<div style="font-size:13px;color:#94a3b8;line-height:1.7;padding:10px 14px;'
-                f'border-radius:6px;background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.06)">'
-                f'{cat["interpret"]}</div>',
-                unsafe_allow_html=True,
-            )
-
-            st.markdown("<br>", unsafe_allow_html=True)
-
-            # Caveats
-            st.markdown("**Caveats**")
-            for caveat in cat["caveats"]:
-                st.markdown(
-                    f'<div style="display:flex;gap:10px;padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.05)">'
-                    f'<span style="color:#f87171;font-size:12px;flex-shrink:0;padding-top:1px">⚠</span>'
-                    f'<span style="font-size:12px;color:#64748b;line-height:1.55">{caveat}</span>'
-                    f'</div>',
-                    unsafe_allow_html=True,
-                )
-
-    st.divider()
-
-    # ── Confidence scoring explained ──────────────────────────────────────────
-    st.markdown("#### Confidence adjustment")
-    st.markdown(
-        '<div style="font-size:13px;color:#94a3b8;line-height:1.7;padding:14px 18px;'
-        'border-radius:8px;background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.07)">'
-        'Every category reports a <b style="color:#e2e8f0">confidence score</b> from 0.0 to 1.0 alongside its signal score. '
-        'When confidence is low — because there are few articles, no price history, or insufficient earnings data — '
-        'the category effective weight in the composite is automatically reduced. '
-        'The formula is: <code style="color:#22d3a0;font-family:IBM Plex Mono,monospace">'
-        'effective_weight = category_weight × (0.3 + 0.7 × confidence)</code>. '
-        'This means even a zero-confidence category contributes 30% of its nominal weight rather than nothing, '
-        'avoiding division-by-zero while still penalising thin data. '
-        'Confidence scores are shown in the Category Breakdown panel on the Tradeability page.'
-        '</div>',
-        unsafe_allow_html=True,
-    )
-
-    st.divider()
-
-    # ── Sentiment model comparison ────────────────────────────────────────────
-    st.markdown("#### Sentiment models")
-    models = [
-        ("VADER", "Current default", "#fbbf24",
-         "Rule-based dictionary lookup. Fast, no download. Scores words like 'beat', 'miss', 'surge', 'plunge'. "
-         "Weakness: doesn't understand financial context — 'revenue in line' scores near zero, "
-         "'margin compression' is unrecognised. Good for getting started.",
-         "config.yaml → sentiment: model: vader"),
-        ("FinBERT", "Recommended", "#22d3a0",
-         "BERT model fine-tuned on 10,000+ financial news articles, analyst reports, and earnings call transcripts. "
-         "Understands jargon: 'beat by a whisker', 'raised full-year guidance', 'supply headwinds'. "
-         "~440MB one-time download. Runs locally on CPU in ~2–5 seconds per batch. "
-         "Significantly more accurate than VADER for financial text.",
-         "config.yaml → sentiment: model: finbert"),
-        ("GPT-4o-mini", "Highest quality", "#a78bfa",
-         "OpenAI API call per batch of 20 articles. Reads headlines in context, handles sarcasm and nuance. "
-         "Best accuracy but costs ~$0.001 per 20 articles (~$0.05 per full basket run). "
-         "Requires OPENAI_API_KEY. Ideal for infrequent high-quality runs.",
-         "config.yaml → sentiment: model: openai + set openai_api_key"),
-    ]
-    for name, tag, color, desc, cfg_note in models:
-        st.markdown(
-            f'<div style="display:flex;gap:16px;padding:14px 16px;margin-bottom:8px;'
-            f'border-radius:8px;background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.07)">'
-            f'<div style="min-width:110px">'
-            f'<div style="font-family:IBM Plex Mono,monospace;font-size:14px;font-weight:600;color:{color}">{name}</div>'
-            f'<div style="font-size:10px;color:#475569;margin-top:3px">{tag}</div>'
-            f'</div>'
-            f'<div>'
-            f'<div style="font-size:13px;color:#94a3b8;line-height:1.6;margin-bottom:6px">{desc}</div>'
-            f'<div style="font-family:IBM Plex Mono,monospace;font-size:10px;color:#334155">'
-            f'To enable: {cfg_note}</div>'
-            f'</div>'
-            f'</div>',
-            unsafe_allow_html=True,
-        )
-
-    st.divider()
-
-    # ── Data sources ──────────────────────────────────────────────────────────
-    st.markdown("#### Data sources")
-    sources = [
-        ("Wire feeds",      "Free",          "#22d3a0", "Business, technology and world news via free RSS. Stored under the source name reuters for historical reasons, but the configured feeds are Dow Jones/WSJ, NYT and MarketWatch — not Reuters. Articles are matched to tickers by keyword and stored as MARKET for macro events."),
-        ("Yahoo Finance",   "Free",          "#22d3a0", "Prices, news, earnings calendar. Always enabled. Uses the yfinance Python library — no API key needed."),
-        ("FinViz",          "Free (public)", "#22d3a0", "News headlines and fundamentals snapshot. Public endpoint used by default. Elite subscription adds screener data."),
-        ("MarketWatch",     "Free",          "#22d3a0", "News headlines and economic calendar. Public pages scraped with polite delay."),
-        ("Alpha Vantage",   "Free key",      "#fbbf24", "Price quotes, earnings, curated news feed. Free tier: 25 requests/day. Get a key at alphavantage.co."),
-        ("Benzinga Pro",    "~$50/mo",       "#f87171", "High-quality earnings data and news. Best source for earnings calendar accuracy."),
-        ("Wall Street Journal", "~$39/mo",   "#f87171", "Long-form market analysis. Requires WSJ+ subscription and session cookie."),
-    ]
-    src_rows = []
-    for name, cost, color, desc in sources:
-        src_rows.append({"Source": name, "Cost": cost, "Description": desc})
-    st.dataframe(pd.DataFrame(src_rows), use_container_width=True, hide_index=True)
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# RUN SCRAPER PAGE
-# ═══════════════════════════════════════════════════════════════════════════════
-elif page == "Run Scraper":
-    st.title("Run Scraper")
-
-    col1, col2 = st.columns(2)
-    mode  = col1.selectbox("Scrape mode", ["all", "news", "earnings", "prices"])
-    model = col2.selectbox("Sentiment model", ["finbert", "vader", "openai"])
-
-    st.info(
-        "**Note:** This runs the scraper in-process. For production use, "
-        "run `python -m mktscan schedule` in a separate terminal."
-    )
-
-    if st.button("▶ Run Now", type="primary", use_container_width=True):
-        from mktscan.engine import ScrapeEngine
-
-        log_placeholder = st.empty()
-        log_lines: list[str] = []
-
-        def stream_log(level: str, msg: str):
-            icons = {"ok": "✅", "warn": "⚠️", "err": "❌", "info": "ℹ️"}
-            icon = icons.get(level, "·")
-            ts = datetime.utcnow().strftime("%H:%M:%S")
-            log_lines.append(f"`{ts}` {icon}  {msg}")
-            log_placeholder.markdown("\n\n".join(log_lines[-25:]))
-
-        try:
-            cfg = load_config()
-            cfg.setdefault("sentiment", {})["model"] = model
-            engine = ScrapeEngine(cfg=cfg, progress_cb=stream_log)
-            with st.spinner("Running..."):
-                result = engine.run(mode=mode)
-
-            st.success(
-                f"✅ Run complete — "
-                f"{result['articles_new']} new articles, "
-                f"{result['tickers_scored']} tickers scored in "
-                f"{result['elapsed_seconds']:.0f}s"
-            )
-
-            if result.get("errors"):
-                with st.expander("Errors"):
-                    for e in result["errors"]:
-                        st.error(e)
-
-            if result.get("sentiment"):
-                st.subheader("Sentiment Results")
-                rows = [
-                    {"Ticker": t, "Score": f"{v['score']:+.3f}",
-                     "Signal": v["label"], "Articles": v["article_count"]}
-                    for t, v in sorted(result["sentiment"].items(), key=lambda x: -x[1]["score"])
-                ]
-                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
-        except FileNotFoundError:
-            st.error("config.yaml not found. Copy config.yaml and fill in your API keys.")
+                fig=go.Figure()
+                fig.add_trace(go.Candlestick(x=bars["market_time"],open=bars["open"],high=bars["high"],low=bars["low"],close=bars["close"],name=ticker,increasing_line_color="#26a69a",decreasing_line_color="#ef5350"))
+                fig.add_trace(go.Scatter(x=bars["market_time"],y=bars["ema_9"],name="EMA 9",line=dict(width=1.2,color="#4c8bf5")))
+                fig.add_trace(go.Scatter(x=bars["market_time"],y=bars["ema_20"],name="EMA 20",line=dict(width=1.2,color="#f2b84b")))
+                if bars["vwap"].notna().any(): fig.add_trace(go.Scatter(x=bars["market_time"],y=bars["vwap"],name="VWAP",line=dict(width=1,dash="dot",color="#b37feb")))
+                if opt and opt.expected_move_dollars and p and p.price:
+                    upper=float(p.price)+float(opt.expected_move_dollars); lower=float(p.price)-float(opt.expected_move_dollars)
+                    fig.add_hline(y=upper,line_dash="dot",line_color="#787b86",annotation_text="Implied upper")
+                    fig.add_hline(y=lower,line_dash="dot",line_color="#787b86",annotation_text="Implied lower")
+                fig.update_layout(template="plotly_dark",paper_bgcolor="#0d0f14",plot_bgcolor="#0d0f14",height=590,margin=dict(l=10,r=10,t=15,b=10),xaxis_rangeslider_visible=False,legend=dict(orientation="h"))
+                st.plotly_chart(fig,use_container_width=True)
+                st.caption(f"Alpaca {feed.upper()} · live chart data cached briefly for performance")
         except Exception as e:
-            st.error(f"Run failed: {e}")
-            raise
+            st.error(f"Live chart unavailable: {e}")
 
-    st.divider()
-    st.subheader("Run History")
-    session = get_session()
-    runs = session.execute(
-        select(ScraperRun).order_by(desc(ScraperRun.started_at)).limit(10)
-    ).scalars().all()
-    session.close()
+    elif section=="Options":
+        if not opt:
+            st.info("No Options Market snapshot is stored for this ticker yet.")
+        else:
+            score=float(sig.score_at_prediction) if sig else None
+            interp=interpret_options_market(opt,score,sig.label_at_prediction if sig else None)
+            c1,c2,c3,c4,c5=st.columns(5)
+            with c1: card("ATM IV",f"{opt.atm_iv*100:.1f}%" if opt.atm_iv is not None and opt.atm_iv<2 else f"{opt.atm_iv:.1f}%" if opt.atm_iv is not None else "—",interp.iv_state)
+            with c2: card("IV Percentile",f"{opt.iv_percentile_1y:.0f}" if opt.iv_percentile_1y is not None else "—","1Y")
+            with c3: card("Term",opt.term_state or "—",f"30D/60D/90D")
+            with c4: card("Put Skew",f"{opt.put_skew*100:+.1f}" if opt.put_skew is not None else "—","vol pts vs ATM")
+            with c5: card("Expected Move",f"±{opt.expected_move_pct:.1f}%" if opt.expected_move_pct is not None else "—",f"±${opt.expected_move_dollars:.2f}" if opt.expected_move_dollars is not None else "")
+            st.markdown(f"**Interpretation:** {interp.thesis}")
+            st.info(f"Preferred expression: **{interp.structure_bias}**")
+            with st.expander("Full volatility surface diagnostics"):
+                st.write(interp.term_view); st.write(interp.skew_view); st.write(interp.move_view)
+                st.dataframe(pd.DataFrame([{"30D IV":opt.iv_30d,"60D IV":opt.iv_60d,"90D IV":opt.iv_90d,"30→60":opt.term_slope_30_60,"60→90":opt.term_slope_60_90,"Put skew":opt.put_skew,"Call skew":opt.call_skew,"Source":opt.source,"Confidence":opt.confidence}]),use_container_width=True,hide_index=True)
+            for c in interp.cautions: st.warning(c)
 
-    if runs:
-        run_rows = []
-        for r in runs:
-            dur = ""
-            if r.finished_at and r.started_at:
-                dur = f"{(r.finished_at - r.started_at).total_seconds():.0f}s"
-            run_rows.append({
-                "Run #":    r.id,
-                "Started":  str(r.started_at)[:16],
-                "Status":   r.status,
-                "Articles": r.articles_new or 0,
-                "Scored":   r.tickers_scored or 0,
-                "Duration": dur,
-            })
-        st.dataframe(pd.DataFrame(run_rows), use_container_width=True, hide_index=True)
-    else:
-        st.info("No runs yet.")
+    elif section=="Trade Builder":
+        st.caption("Expensive live chain access only runs when this view is opened.")
+        try:
+            with st.spinner("Loading current tradeability and option chain…"):
+                result=live_tradeability().get(ticker)
+                setup=generate_basket_setups({ticker:result},max_workers=1).get(ticker) if result else None
+            if not setup or not setup.get("tradeable"):
+                st.warning((setup or {}).get("reason","No tradeable structure generated."))
+            else:
+                c1,c2,c3,c4=st.columns(4)
+                with c1: card("Structure",setup.get("strategy","—"),setup.get("confidence_tier",""))
+                with c2: card("Cost / Credit",f"${float(setup.get('net_debit') or setup.get('net_credit') or 0)*100:,.0f}","per 1-lot")
+                with c3: card("Max Loss",f"${abs(float(setup.get('max_loss') or 0))*100:,.0f}","per 1-lot")
+                with c4: card("Breakeven",f"${float(setup.get('breakeven') or 0):.2f}" if setup.get("breakeven") else "—",f"DTE {setup.get('dte','—')}")
+                legs=pd.DataFrame(setup.get("legs",[]))
+                if not legs.empty:
+                    keep=[x for x in ["action","right","strike","expiry","bid","ask","fill","delta","theta","vega","open_interest","volume"] if x in legs.columns]
+                    st.dataframe(legs[keep],use_container_width=True,hide_index=True)
+                st.caption(f"Net Δ {setup.get('net_delta','—')} · Theta/day ${setup.get('net_theta_per_day_per_contract','—')} · Vega ${setup.get('net_vega_per_contract','—')}")
+                for w in setup.get("warnings",[]): st.warning(w)
+                st.button("Log this trade", type="primary", on_click=nav_to_journal, args=(ticker, setup.get("strategy", "")))
+                st.caption(DISCLAIMER)
+        except Exception as e:
+            st.error(f"Trade builder failed: {e}")
+
+    elif section=="ChatGPT Research":
+        st.markdown("### ChatGPT research handoff")
+        st.caption("MktScan remains the quantitative model. Use ChatGPT as a qualitative research and adversarial-review layer.")
+        tech=technical_opportunity(ticker)
+        score=float(sig.score_at_prediction) if sig else None
+        preset=st.selectbox("Research task",["Challenge the thesis","Explain the move","Identify catalysts","Evaluate risks","Compare with peers","Earnings review"])
+        context={
+            "ticker":ticker,"market_regime":regime.regime_label if regime else None,"tradeability":score,"signal":semantic_signal(score),
+            "trend":tech.trend_state,"momentum":tech.momentum_state,"relative_strength":tech.relative_strength_state,"rvol":tech.rvol20,
+            "iv_percentile":opt.iv_percentile_1y if opt else None,"term_structure":opt.term_state if opt else None,"expected_move_pct":opt.expected_move_pct if opt else None,
+            "earnings":earn.report_date.isoformat() if earn and earn.report_date else None,
+        }
+        tasks={
+            "Challenge the thesis":"Act as an adversarial equity analyst. Identify the strongest reasons this setup could fail, missing catalysts, and what evidence would invalidate the thesis.",
+            "Explain the move":"Explain the likely company, sector, macro, and positioning drivers behind the recent price action. Distinguish confirmed facts from hypotheses.",
+            "Identify catalysts":"Identify near-term catalysts and event risks that could matter over the next 1-8 weeks.",
+            "Evaluate risks":"Assess business, valuation, macro, event, technical, and options-market risks relevant to this setup.",
+            "Compare with peers":"Compare this ticker with its most relevant public peers on momentum, catalysts, valuation narrative, and competitive position.",
+            "Earnings review":"Summarize the latest earnings/guidance themes and identify the questions that matter most for the next report.",
+        }
+        prompt=f"""Research {ticker}.\n\nMktScan quantitative context:\n{json.dumps(context,indent=2,default=str)}\n\nTask:\n{tasks[preset]}\n\nDo not treat the MktScan signal as ground truth. Challenge it. Cite current sources and call out stale or uncertain information."""
+        st.code(prompt,language=None)
+        st.info("Copy this prompt into ChatGPT. A direct API integration is intentionally not required for the dashboard to work.")
+
+    elif section=="Advanced":
+        tech=technical_opportunity(ticker)
+        st.markdown("### Advanced diagnostics")
+        st.dataframe(pd.DataFrame([tech.__dict__]),use_container_width=True,hide_index=True)
+        if p:
+            st.markdown("#### Persisted price/fundamental snapshot")
+            vals={k:v for k,v in p.__dict__.items() if not k.startswith("_")}
+            st.json(vals,expanded=False)
+        if opt:
+            st.markdown("#### Raw options snapshot")
+            vals={k:v for k,v in opt.__dict__.items() if not k.startswith("_")}
+            st.json(vals,expanded=False)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PORTFOLIO — open risk first, journal second
+# ─────────────────────────────────────────────────────────────────────────────
+elif area == "Portfolio":
+    st.markdown("## Portfolio")
+    st.caption("Open positions, concentration risk, and trade journal in one place.")
+    if "portfolio_view" not in st.session_state: st.session_state["portfolio_view"]="Open Positions"
+    view=st.radio("Portfolio view",["Open Positions","Risk","Journal"],key="portfolio_view",horizontal=True,label_visibility="collapsed")
+    s=get_session()
+    try:
+        trades=s.execute(select(TradeJournalEntry).order_by(desc(TradeJournalEntry.opened_at))).scalars().all()
+        open_trades=[t for t in trades if t.status=="OPEN"]
+        closed=[t for t in trades if t.status=="CLOSED"]
+        if view=="Open Positions":
+            marked=sum((trade_metrics(t,True).pnl or 0) for t in open_trades); risk=sum(float(t.planned_max_loss or 0) for t in open_trades)
+            c1,c2,c3,c4=st.columns(4)
+            c1.metric("Open P&L",f"${marked:,.0f}"); c2.metric("Capital at Risk",f"${risk:,.0f}"); c3.metric("Positions",len(open_trades)); c4.metric("Net Bias",("Bullish" if sum(1 if t.direction=="BULLISH" else -1 for t in open_trades)>0 else "Bearish" if open_trades else "Flat"))
+            rows=[]
+            for t in open_trades:
+                m=trade_metrics(t,True); rows.append({"ID":t.id,"Ticker":t.ticker,"Strategy":t.strategy,"Direction":t.direction,"Opened":t.opened_at.date(),"Mark":t.current_value,"P&L":m.pnl,"ROR %":m.return_on_risk_pct,"Risk":t.planned_max_loss})
+            st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
+            if open_trades:
+                tid=st.selectbox("Manage position",[t.id for t in open_trades],format_func=lambda i: next(f"#{t.id} · {t.ticker} · {t.strategy}" for t in open_trades if t.id==i))
+                t=next(x for x in open_trades if x.id==tid)
+                a,b=st.columns(2)
+                with a:
+                    with st.form("mark_trade"):
+                        mark=st.number_input("Current option/position value",min_value=0.0,value=float(t.current_value or t.entry_value or 0),step=.01)
+                        if st.form_submit_button("Update mark"):
+                            mark_trade(s,t,mark); st.cache_data.clear(); st.rerun()
+                with b:
+                    with st.form("close_trade"):
+                        exitv=st.number_input("Exit value",min_value=0.0,value=float(t.current_value or t.entry_value or 0),step=.01)
+                        underlying=st.number_input("Underlying exit",min_value=0.0,value=float(prices.get(t.ticker).price if prices.get(t.ticker) and prices.get(t.ticker).price else 0),step=.01)
+                        reason=st.selectbox("Exit reason",["Profit target","Stop loss","Signal reversal","Technical invalidation","Time exit","Pre-earnings exit","Manual discretion","Expiration","Other"])
+                        if st.form_submit_button("Close trade"):
+                            close_trade(s,t,closed_at=datetime.utcnow(),underlying_exit=underlying,exit_value=exitv,exit_reason=reason); st.cache_data.clear(); st.rerun()
+        elif view=="Risk":
+            risk=sum(float(t.planned_max_loss or 0) for t in open_trades)
+            rows=[]
+            for t in open_trades:
+                r=float(t.planned_max_loss or 0); rows.append({"Ticker":t.ticker,"Strategy":t.strategy,"Direction":t.direction,"Risk $":r,"% Risk":(r/risk*100 if risk else 0)})
+            rdf=pd.DataFrame(rows)
+            if rdf.empty: st.info("Log open trades to populate portfolio risk.")
+            else:
+                st.dataframe(rdf.sort_values("Risk $",ascending=False),use_container_width=True,hide_index=True)
+                by=rdf.groupby("Ticker",as_index=False)["Risk $"].sum().sort_values("Risk $",ascending=False)
+                for _,row in by.iterrows():
+                    pct=row["Risk $"]/risk*100 if risk else 0
+                    if pct>=35: st.warning(f"{row['Ticker']} represents {pct:.0f}% of recorded portfolio risk.")
+                st.caption("Portfolio Greeks/correlation are intentionally omitted until live option positions can be matched to reliable contract-level Greeks.")
+        else:  # Journal
+            sub=st.radio("Journal",["Log Trade","History","Trade Review"],horizontal=True,label_visibility="collapsed")
+            if sub=="Log Trade":
+                pre=st.session_state.get("journal_prefill_ticker",ticker); strat=st.session_state.get("journal_prefill_strategy","")
+                with st.form("new_trade"):
+                    c1,c2,c3=st.columns(3)
+                    tk=c1.selectbox("Ticker",tickers,index=tickers.index(pre) if pre in tickers else 0)
+                    direction=c2.selectbox("Direction",["BULLISH","BEARISH"])
+                    strategy=c3.text_input("Strategy",value=strat or "Long Call")
+                    c4,c5,c6=st.columns(3)
+                    instrument=c4.selectbox("Instrument",["OPTION","STOCK"]); entry_type=c5.selectbox("Entry type",["DEBIT","CREDIT"]); qty=c6.number_input("Quantity",min_value=.01,value=1.0)
+                    c7,c8,c9=st.columns(3)
+                    underlying_entry=c7.number_input("Underlying entry",min_value=0.0,value=float(prices.get(tk).price if prices.get(tk) and prices.get(tk).price else 0),step=.01)
+                    entry_value=c8.number_input("Entry premium/value",min_value=0.0,value=1.0,step=.01); max_loss=c9.number_input("Planned max loss $",min_value=0.0,value=100.0,step=25.0)
+                    thesis=st.text_area("Trade thesis"); tags=st.text_input("Tags",placeholder="momentum, breakout, earnings")
+                    stop=st.text_input("Stop / invalidation"); target=st.text_input("Profit target")
+                    submitted=st.form_submit_button("Log trade",type="primary")
+                if submitted:
+                    create_trade(s,ticker=tk,instrument_type=instrument,direction=direction,strategy=strategy,status="OPEN",opened_at=datetime.utcnow(),underlying_entry=underlying_entry,quantity=qty,multiplier=100 if instrument=="OPTION" else 1,entry_type=entry_type,entry_value=entry_value,planned_max_loss=max_loss,thesis=thesis,tags=tags,stop_condition=stop,profit_target=target)
+                    st.success("Trade logged with immutable MktScan entry context."); st.cache_data.clear(); st.session_state.pop("journal_prefill_strategy",None)
+            elif sub=="History":
+                rows=[]
+                for t in trades:
+                    m=trade_metrics(t,t.status=="OPEN"); rows.append({"ID":t.id,"Date":t.opened_at.date(),"Ticker":t.ticker,"Strategy":t.strategy,"Status":t.status,"P&L":m.pnl if t.status=="OPEN" else t.realized_pnl,"ROR %":m.return_on_risk_pct if t.status=="OPEN" else t.return_on_risk_pct,"Regime":t.regime_label,"IV Pct":t.iv_percentile,"Signal":t.tradeability_label})
+                st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
+            else:
+                if not closed: st.info("Close trades to unlock attribution reviews.")
+                else:
+                    tid=st.selectbox("Closed trade",[t.id for t in closed],format_func=lambda i: next(f"#{t.id} · {t.ticker} · {t.strategy}" for t in closed if t.id==i))
+                    t=next(x for x in closed if x.id==tid)
+                    underlying_ret=((t.underlying_exit/t.underlying_entry-1)*100) if t.underlying_entry and t.underlying_exit else None
+                    direction_ok=(underlying_ret is not None and ((t.direction=="BULLISH" and underlying_ret>0) or (t.direction=="BEARISH" and underlying_ret<0)))
+                    pnl=float(t.realized_pnl or 0)
+                    if underlying_ret is None: diagnosis="NEEDS UNDERLYING EXIT"
+                    elif direction_ok and pnl>0: diagnosis="MODEL + STRUCTURE WORKED"
+                    elif direction_ok and pnl<=0: diagnosis="STRUCTURE / EXECUTION ERROR"
+                    elif not direction_ok and pnl<=0: diagnosis="DIRECTIONAL THESIS ERROR"
+                    else: diagnosis="P&L POSITIVE DESPITE THESIS"
+                    st.markdown(f"### {diagnosis}")
+                    c1,c2,c3=st.columns(3); c1.metric("Underlying return",f"{underlying_ret:+.1f}%" if underlying_ret is not None else "—"); c2.metric("Trade P&L",f"${pnl:,.0f}"); c3.metric("Return on risk",f"{t.return_on_risk_pct:+.1f}%" if t.return_on_risk_pct is not None else "—")
+                    st.caption(f"Entry signal {t.tradeability_label or '—'} · regime {t.regime_label or '—'} · IV pct {t.iv_percentile if t.iv_percentile is not None else '—'}")
+    finally:
+        s.close()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VALIDATION — does the system work?
+# ─────────────────────────────────────────────────────────────────────────────
+elif area == "Validation":
+    st.markdown("## Validation")
+    st.caption("Live trading outcomes, signal calibration, backtests, and attribution.")
+    view=st.radio("Validation view",["Live Performance","Signal Calibration","Backtest","Attribution"],horizontal=True,label_visibility="collapsed")
+    s=get_session()
+    try:
+        if view=="Live Performance":
+            closed=s.execute(select(TradeJournalEntry).where(TradeJournalEntry.status=="CLOSED").order_by(TradeJournalEntry.closed_at)).scalars().all()
+            pnls=[float(t.realized_pnl or 0) for t in closed]; wins=[x for x in pnls if x>0]; losses=[x for x in pnls if x<0]
+            net=sum(pnls); winrate=(len(wins)/len(pnls)*100) if pnls else None; pf=(sum(wins)/abs(sum(losses))) if losses else None; expectancy=(net/len(pnls)) if pnls else None
+            c1,c2,c3,c4=st.columns(4); c1.metric("Net P&L",f"${net:,.0f}"); c2.metric("Trades",len(pnls)); c3.metric("Win Rate",f"{winrate:.1f}%" if winrate is not None else "—"); c4.metric("Profit Factor",f"{pf:.2f}" if pf is not None else "—")
+            if pnls:
+                curve=pd.DataFrame({"Trade":range(1,len(pnls)+1),"Cumulative P&L":pd.Series(pnls).cumsum()})
+                st.line_chart(curve.set_index("Trade"),height=300)
+                st.caption(f"Expectancy per closed trade: ${expectancy:,.0f}")
+        elif view=="Signal Calibration":
+            rows=s.execute(select(TradeabilityOutcome).where(TradeabilityOutcome.actual_return_pct.isnot(None))).scalars().all()
+            if not rows: st.info("No resolved forward outcomes yet.")
+            else:
+                n=len(rows); acc=sum(1 for r in rows if r.direction_correct)/n*100
+                c1,c2=st.columns(2); c1.metric("Resolved signals",n); c2.metric("Directional accuracy",f"{acc:.1f}%")
+                df=pd.DataFrame([{"Ticker":r.ticker,"Score":r.score_at_prediction,"Return %":r.actual_return_pct,"Correct":r.direction_correct,"Regime":r.regime_label_at_prediction} for r in rows])
+                df["Score bucket"]=pd.cut(df["Score"],[-1,-.5,-.2,.2,.5,1],labels=["Strong Bear","Bear","Neutral","Bull","Strong Bull"])
+                cal=df.groupby("Score bucket",observed=True).agg(N=("Ticker","size"),Avg_Return=("Return %","mean"),Accuracy=("Correct","mean")).reset_index(); cal["Accuracy"]*=100
+                st.dataframe(cal,use_container_width=True,hide_index=True)
+        elif view=="Backtest":
+            try:
+                from mktscan.backtest_incremental import BacktestObservation, BacktestSummary
+                sums=s.execute(select(BacktestSummary).order_by(BacktestSummary.label,BacktestSummary.holding_days)).scalars().all()
+                if sums:
+                    st.dataframe(pd.DataFrame([{"Label":r.label,"Days":r.holding_days,"N":r.n_observations,"Avg Return %":r.avg_return_pct,"Excess %":r.excess_return_pct,"Win Rate %":r.win_rate_pct,"Option P&L %":r.option_avg_pnl_pct,"Option Win %":r.option_win_rate} for r in sums]),use_container_width=True,hide_index=True)
+                else: st.info("Backtest summary is empty. Run the incremental backtest first.")
+            except Exception as e: st.error(f"Backtest data unavailable: {e}")
+        else:
+            closed=s.execute(select(TradeJournalEntry).where(TradeJournalEntry.status=="CLOSED")).scalars().all()
+            if not closed: st.info("No closed journal trades yet.")
+            else:
+                df=pd.DataFrame([{"Ticker":t.ticker,"Strategy":t.strategy,"P&L":t.realized_pnl or 0,"ROR":t.return_on_risk_pct,"Regime":t.regime_label or "Unknown","IV Pct":t.iv_percentile,"Signal":t.tradeability_label or "Unknown"} for t in closed])
+                left,right=st.columns(2)
+                with left:
+                    st.markdown("#### By strategy"); st.dataframe(df.groupby("Strategy").agg(N=("Ticker","size"),PnL=("P&L","sum"),Avg_ROR=("ROR","mean")).reset_index().sort_values("PnL",ascending=False),use_container_width=True,hide_index=True)
+                with right:
+                    st.markdown("#### By market regime"); st.dataframe(df.groupby("Regime").agg(N=("Ticker","size"),PnL=("P&L","sum"),Avg_ROR=("ROR","mean")).reset_index().sort_values("PnL",ascending=False),use_container_width=True,hide_index=True)
+                if df["IV Pct"].notna().any():
+                    df["IV Bucket"]=pd.cut(df["IV Pct"],[-1,20,40,60,80,101],labels=["<20","20-40","40-60","60-80","80+"])
+                    st.markdown("#### By IV percentile")
+                    st.dataframe(df.groupby("IV Bucket",observed=True).agg(N=("Ticker","size"),PnL=("P&L","sum"),Avg_ROR=("ROR","mean")).reset_index(),use_container_width=True,hide_index=True)
+    finally:
+        s.close()

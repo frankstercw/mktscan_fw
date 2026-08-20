@@ -1,3 +1,7 @@
+
+## Decision Terminal v2
+
+The dashboard now uses a simplified four-area workflow: **Today → Research → Portfolio → Validation**. See `DECISION_TERMINAL.md` for the UI architecture, lazy-loading behavior, ChatGPT research handoff, and workflow details.
 # MktScan — Market Intelligence & Options Setup Engine
 
 A self-hosted system that scrapes stock news, earnings and market data, scores a
