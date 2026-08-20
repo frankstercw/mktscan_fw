@@ -1,12 +1,13 @@
 """MktScan Decision Terminal v2.
 
 A compact four-area Streamlit interface inspired by professional trading terminals:
-TODAY -> RESEARCH -> PORTFOLIO -> VALIDATION.
+TODAY -> RESEARCH -> KEY EVENTS -> PORTFOLIO -> VALIDATION.
 
 The UI intentionally prioritizes conclusions and drill-down over dense raw tables.
 """
 from __future__ import annotations
 
+import calendar
 import json
 import os
 import sys
@@ -196,6 +197,90 @@ def next_macro_event():
         s.close()
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def key_events_between(start_at: datetime, end_at: datetime) -> list[dict]:
+    """Economic calendar + basket earnings for the requested calendar window."""
+    s = get_session()
+    try:
+        macro_rows = s.execute(
+            select(MacroEvent)
+            .where(MacroEvent.event_at >= start_at, MacroEvent.event_at < end_at)
+            .order_by(MacroEvent.event_at)
+        ).scalars().all()
+        earnings_rows = s.execute(
+            select(EarningsEvent)
+            .where(EarningsEvent.report_date >= start_at, EarningsEvent.report_date < end_at)
+            .order_by(EarningsEvent.report_date)
+        ).scalars().all()
+        events = []
+        for r in macro_rows:
+            events.append({
+                "kind": "ECON",
+                "at": r.event_at,
+                "title": r.name,
+                "ticker": None,
+                "importance": r.importance or "Normal",
+                "source": r.source or "MarketWatch",
+                "category": r.category or "Economic",
+                "consensus": r.consensus,
+                "prior": r.prior,
+                "actual": r.actual,
+            })
+        for r in earnings_rows:
+            events.append({
+                "kind": "EARN",
+                "at": r.report_date,
+                "title": f"{r.ticker} Earnings",
+                "ticker": r.ticker,
+                "importance": "Company",
+                "source": "Yahoo Finance",
+                "category": "Earnings",
+                "consensus": f"EPS {r.eps_estimate:.2f}" if r.eps_estimate is not None else None,
+                "prior": None,
+                "actual": f"EPS {r.eps_actual:.2f}" if r.eps_actual is not None else None,
+            })
+        return sorted(events, key=lambda x: x["at"])
+    finally:
+        s.close()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def live_treasury_yields() -> dict[str, dict]:
+    """Near-real-time 10Y/30Y Treasury yield proxies from Yahoo Finance CBOE yield indexes."""
+    out = {}
+    try:
+        import yfinance as yf
+        for label, symbol in (("10Y", "^TNX"), ("30Y", "^TYX")):
+            t = yf.Ticker(symbol)
+            fi = t.fast_info
+            raw = getattr(fi, "last_price", None)
+            prev = getattr(fi, "previous_close", None)
+            current = float(raw) / 10.0 if raw is not None else None
+            previous = float(prev) / 10.0 if prev is not None else None
+            delta_bps = (current - previous) * 100.0 if current is not None and previous is not None else None
+            out[label] = {
+                "yield": current,
+                "delta_bps": delta_bps,
+                "symbol": symbol,
+                "source": "Yahoo Finance / CBOE Treasury Yield Index",
+                "as_of": datetime.utcnow(),
+            }
+    except Exception:
+        pass
+
+    if "10Y" not in out or out["10Y"].get("yield") is None:
+        r = latest_regime()
+        if r and r.ten_year_yield is not None:
+            out["10Y"] = {
+                "yield": float(r.ten_year_yield),
+                "delta_bps": None,
+                "symbol": "persisted",
+                "source": "MktScan market-regime snapshot",
+                "as_of": r.snapped_at,
+            }
+    return out
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def data_freshness() -> dict[str, datetime | None]:
     s = get_session()
@@ -294,8 +379,73 @@ def signal_color(label: str) -> str:
     return ""
 
 
-def card(label: str, value: str, sub: str = "", cls: str = ""):
-    st.markdown(f'<div class="tv-card"><div class="tv-kicker">{label}</div><div class="tv-value {cls}">{value}</div><div class="tv-small">{sub}</div></div>', unsafe_allow_html=True)
+METRIC_HELP: dict[str, dict[str, str]] = {
+    "Market": {"source": "MktScan MarketRegimeSnapshot", "definition": "Composite market-risk regime derived from SPY/QQQ trend, volatility, breadth, rates and macro context.", "interpret": "RISK_ON supports taking directional risk; RISK_OFF argues for more defensive sizing and stricter confirmation."},
+    "VIX": {"source": "MktScan regime pipeline / VIX market data", "definition": "CBOE Volatility Index level used as a proxy for expected 30-day S&P 500 volatility.", "interpret": "Higher/rising VIX generally means more market stress and richer option volatility; context matters more than the absolute level alone."},
+    "Open P&L": {"source": "MktScan Trade Journal", "definition": "Estimated P&L of currently open journal positions using the latest stored mark.", "interpret": "Positive is unrealized profit; stale marks can make this differ from brokerage P&L."},
+    "Capital at Risk": {"source": "MktScan Trade Journal", "definition": "Sum of planned maximum loss across open positions.", "interpret": "Use it as a portfolio risk budget, not as a forecast of likely loss."},
+    "10Y Treasury": {"source": "Yahoo Finance / CBOE ^TNX; fallback to MktScan regime snapshot", "definition": "Near-real-time U.S. 10-year Treasury yield proxy.", "interpret": "Rapidly rising long rates can pressure long-duration/growth equities; falling yields can ease valuation pressure. Watch the direction and basis-point change."},
+    "30Y Treasury": {"source": "Yahoo Finance / CBOE ^TYX", "definition": "Near-real-time U.S. 30-year Treasury yield proxy.", "interpret": "Useful for tracking the long end of the curve and long-run growth/inflation expectations. Compare it with the 10Y and its daily change."},
+    "Setup": {"source": "MktScan setup-quality heuristic", "definition": "Qualitative ranking combining signal strength, regime alignment, IV context, event risk and technical state.", "interpret": "HIGH means several independent dimensions align; it is a prioritization aid, not a validated probability."},
+    "Signal": {"source": "MktScan TradeabilityOutcome", "definition": "Semantic translation of the latest persisted tradeability score.", "interpret": "Bullish/bearish indicates direction; stronger labels indicate larger score magnitude."},
+    "Score": {"source": "MktScan tradeability model", "definition": "Composite directional score, typically ranging from -1 to +1.", "interpret": "Positive favors bullish direction, negative favors bearish direction; compare magnitude and validation history rather than treating a cutoff as certainty."},
+    "IV": {"source": "MktScan OptionsMarketSnapshot / option-chain IV history", "definition": "Semantic state of the ticker's current implied-volatility percentile.", "interpret": "LOW IV can favor debit structures; HIGH IV can favor defined-risk premium-selling structures when the directional thesis supports them."},
+    "Regime": {"source": "MktScan MarketRegimeSnapshot", "definition": "Current broad-market risk environment.", "interpret": "Use it to judge whether the broad tape supports or conflicts with a ticker-level setup."},
+    "Risk": {"source": "MktScan EarningsEvent and event logic", "definition": "Near-term event warning shown for the setup.", "interpret": "An event close to the trade horizon can dominate normal technical/volatility behavior and deserves explicit planning."},
+    "Price": {"source": "MktScan PriceSnapshot; intraday charts use Alpaca", "definition": "Latest persisted underlying price for scanner views.", "interpret": "Use with freshness timestamp; persisted scanner price is not necessarily tick-by-tick."},
+    "Change %": {"source": "MktScan PriceSnapshot", "definition": "Latest stored daily percentage price change.", "interpret": "Large moves can confirm momentum but may also indicate extension; compare with volume and expected move."},
+    "Underlying return": {"source": "MktScan Trade Journal", "definition": "Percentage change in the underlying between journal entry and exit prices.", "interpret": "Compare it with trade P&L to separate directional thesis quality from option-structure/execution quality."},
+    "Trade P&L": {"source": "MktScan Trade Journal", "definition": "Realized dollar profit or loss recorded for a closed journal trade.", "interpret": "Evaluate alongside return on risk and thesis correctness; dollar P&L alone is scale-dependent."},
+    "Return on risk": {"source": "MktScan Trade Journal", "definition": "Trade P&L divided by planned/defined capital at risk.", "interpret": "Higher positive ROR indicates more efficient use of risk capital; compare across strategies with similar holding periods."},
+    "Net P&L": {"source": "MktScan Trade Journal", "definition": "Sum of realized P&L across closed journal trades.", "interpret": "Measures total realized dollars but does not normalize for capital, time or changing position size."},
+    "Trades": {"source": "MktScan Trade Journal", "definition": "Number of closed trades included in the performance sample.", "interpret": "Larger samples make performance metrics more informative; small samples are noisy."},
+    "Win Rate": {"source": "MktScan Trade Journal", "definition": "Percentage of closed trades with positive realized P&L.", "interpret": "Higher is not automatically better; interpret with average win/loss and profit factor."},
+    "Profit Factor": {"source": "MktScan Trade Journal", "definition": "Gross profits divided by absolute gross losses.", "interpret": ">1 means gross profits exceed gross losses; values materially above 1 are stronger, but sample size matters."},
+    "Resolved signals": {"source": "MktScan TradeabilityOutcome", "definition": "Number of historical signals with a realized forward outcome.", "interpret": "This is the calibration sample size; more observations generally increase confidence in validation results."},
+    "Directional accuracy": {"source": "MktScan TradeabilityOutcome", "definition": "Share of resolved signals whose score direction matched the sign of the subsequent return.", "interpret": ">50% can be useful depending on payoff asymmetry, but accuracy alone does not establish profitability."},
+    "Positions": {"source": "MktScan Trade Journal", "definition": "Count of currently open journal positions.", "interpret": "Use with capital at risk and concentration; position count can understate risk when trades are highly correlated."},
+    "Net Bias": {"source": "MktScan Trade Journal", "definition": "Simple directional balance of open bullish versus bearish journal positions.", "interpret": "Shows portfolio directional tilt; it is not delta-weighted until live contract Greeks are integrated."},
+    "Setup Quality": {"source": "MktScan terminal.setup_quality", "definition": "Workflow heuristic combining tradeability, regime, technical state, IV and event proximity.", "interpret": "Use HIGH/MODERATE/LOW to prioritize review. It is intentionally not presented as a calibrated probability."},
+    "Trend": {"source": "MktScan technical_opportunity from underlying OHLCV", "definition": "Trend state derived from moving averages and ADX/trend-strength context.", "interpret": "Strong bullish/bearish trend alignment supports directional trades; weak trend argues for lower conviction."},
+    "Momentum": {"source": "MktScan technical_opportunity from underlying OHLCV", "definition": "Momentum state derived from recent returns, acceleration and RSI context.", "interpret": "Accelerating momentum supports continuation setups; decelerating momentum can warn that a move is losing force."},
+    "Relative Strength": {"source": "MktScan technical_opportunity vs SPY/QQQ", "definition": "Ticker performance relative to broad-market benchmarks over the configured lookback.", "interpret": "Positive/strong relative strength means the ticker is outperforming its benchmark, useful confirmation for long momentum setups."},
+    "Volume": {"source": "Underlying OHLCV via MktScan technical pipeline", "definition": "Volume confirmation state using relative volume versus recent history.", "interpret": "Higher RVOL can validate breakouts/momentum; low volume makes price moves less convincing."},
+    "ATM IV": {"source": "MktScan OptionsMarketSnapshot from option-chain data", "definition": "Implied volatility of options nearest at-the-money.", "interpret": "Higher ATM IV means the market prices a wider future return distribution and generally richer option premiums."},
+    "IV Percentile": {"source": "MktScan IV history / OptionsMarketSnapshot", "definition": "Percent of trailing historical IV observations below the current IV.", "interpret": "Low percentile means IV is historically inexpensive; high percentile means it is historically rich."},
+    "Term": {"source": "MktScan OptionsMarketSnapshot", "definition": "Shape of implied volatility across 30D, 60D and 90D expirations.", "interpret": "Backwardation signals expensive near-term volatility/event risk; contango is a more normal upward-sloping curve."},
+    "Put Skew": {"source": "MktScan OptionsMarketSnapshot", "definition": "25-delta put IV relative to ATM IV.", "interpret": "Positive/rising put skew means downside protection is carrying a volatility premium."},
+    "Expected Move": {"source": "MktScan OptionsMarketSnapshot", "definition": "Option-implied magnitude of the underlying move over the selected horizon.", "interpret": "Treat it as the move embedded in option pricing, not a directional forecast. Compare it with your own thesis."},
+    "Structure": {"source": "MktScan options strategy engine", "definition": "Option structure selected for the current directional and volatility context.", "interpret": "Use as a starting structure to evaluate; confirm payoff, liquidity, event risk and sizing before trading."},
+    "Cost / Credit": {"source": "MktScan options strategy engine / option-chain marks", "definition": "Estimated debit paid or credit received for one standard option spread/position.", "interpret": "For debit trades it is capital spent; for credit trades compare the credit with maximum defined loss."},
+    "Max Loss": {"source": "MktScan options payoff model", "definition": "Estimated worst-case loss for the proposed defined-risk option structure.", "interpret": "Use this as the core position-sizing input; never size solely from premium paid/received if max risk differs."},
+    "Breakeven": {"source": "MktScan options payoff model", "definition": "Underlying price at expiration where the proposed option position has approximately zero P&L.", "interpret": "Compare breakeven with spot, expected move and your price target to judge whether the thesis has enough room."},
+}
+
+def metric_help(label: str, source: str | None = None, definition: str | None = None, interpret: str | None = None) -> str:
+    d = METRIC_HELP.get(label, {})
+    src = source or d.get("source", "MktScan")
+    defin = definition or d.get("definition", f"{label} metric used by the MktScan decision workflow.")
+    interp = interpret or d.get("interpret", "Interpret in context with the surrounding signal, regime, event risk and data freshness.")
+    return f"Source: {src}\\n\\nDefinition: {defin}\\n\\nHow to interpret: {interp}"
+
+def ui_metric(container, label: str, value, delta=None, **kwargs):
+    kwargs.setdefault("help", metric_help(label))
+    return container.metric(label, value, delta=delta, **kwargs)
+
+def card(label: str, value: str, sub: str = "", cls: str = "", help_text: str | None = None):
+    tip = (help_text or metric_help(label)).replace('"', '&quot;').replace("\\n", " • ")
+    st.markdown(
+        f'<div class="tv-card" title="{tip}"><div class="tv-kicker">{label} ⓘ</div>'
+        f'<div class="tv-value {cls}">{value}</div><div class="tv-small">{sub}</div></div>',
+        unsafe_allow_html=True,
+    )
+
+def dataframe_with_help(df: pd.DataFrame, help_overrides: dict[str, str] | None = None, **kwargs):
+    overrides = help_overrides or {}
+    cfg = {}
+    for col in df.columns:
+        cfg[col] = st.column_config.Column(col, help=overrides.get(col, metric_help(str(col))))
+    return st.dataframe(df, column_config=cfg, **kwargs)
 
 
 def nav_to(area: str, ticker: str | None = None, section: str | None = None):
@@ -341,14 +491,14 @@ if not tickers:
     st.stop()
 if st.session_state.get("global_ticker") not in tickers:
     st.session_state["global_ticker"] = tickers[0]
-if st.session_state.get("area") not in {"Today", "Research", "Portfolio", "Validation"}:
+if st.session_state.get("area") not in {"Today", "Research", "Key Events", "Portfolio", "Validation"}:
     st.session_state["area"] = "Today"
 
 with st.sidebar:
     st.markdown("### ◈ MktScan")
     st.caption("Decision Terminal")
     st.selectbox("Ticker", tickers, key="global_ticker")
-    st.radio("", ["Today", "Research", "Portfolio", "Validation"], key="area", label_visibility="collapsed")
+    st.radio("", ["Today", "Research", "Key Events", "Portfolio", "Validation"], key="area", label_visibility="collapsed")
     st.divider()
     fresh = data_freshness()
     st.caption("DATA FRESHNESS")
@@ -392,17 +542,23 @@ if area == "Today":
         open_s.close()
     marked_pnl = sum((trade_metrics(t, use_current=True).pnl or 0) for t in open_trades)
     capital_risk = sum(float(t.planned_max_loss or 0) for t in open_trades)
-    macro = next_macro_event()
+    treasuries = live_treasury_yields()
 
-    c1,c2,c3,c4,c5 = st.columns(5)
+    c1,c2,c3,c4,c5,c6 = st.columns(6)
     with c1: card("Market", regime.regime_label if regime else "UNKNOWN", f"confidence {(regime.confidence or 0):.0%}" if regime else "", signal_color(regime.regime_label if regime else ""))
     with c2: card("VIX", f"{regime.vix:.1f}" if regime and regime.vix is not None else "—", regime.volatility_state if regime else "")
     with c3: card("Open P&L", f"${marked_pnl:,.0f}", f"{len(open_trades)} open positions", "tv-bull" if marked_pnl >= 0 else "tv-bear")
     with c4: card("Capital at Risk", f"${capital_risk:,.0f}", "journal planned max loss")
     with c5:
-        if macro:
-            card("Next Event", macro.name[:28], macro.event_at.strftime("%a %H:%M UTC"))
-        else: card("Next Event", "None scheduled", "macro calendar")
+        t10 = treasuries.get("10Y", {})
+        y10 = t10.get("yield")
+        d10 = t10.get("delta_bps")
+        card("10Y Treasury", f"{y10:.3f}%" if y10 is not None else "—", f"{d10:+.1f} bps vs prev close" if d10 is not None else "near-real-time")
+    with c6:
+        t30 = treasuries.get("30Y", {})
+        y30 = t30.get("yield")
+        d30 = t30.get("delta_bps")
+        card("30Y Treasury", f"{y30:.3f}%" if y30 is not None else "—", f"{d30:+.1f} bps vs prev close" if d30 is not None else "near-real-time")
 
     st.markdown('<div class="tv-section">Top opportunities</div>', unsafe_allow_html=True)
     rows=[]
@@ -426,7 +582,7 @@ if area == "Today":
     show=df.copy()
     if min_setup=="Moderate+": show=show[show["Setup"].isin(["MODERATE","HIGH"])]
     elif min_setup=="High only": show=show[show["Setup"]=="HIGH"]
-    st.dataframe(show.drop(columns=["_q"]), use_container_width=True, hide_index=True, height=min(500, 55+35*max(1,len(show))))
+    dataframe_with_help(show.drop(columns=["_q"]), use_container_width=True, hide_index=True, height=min(500, 55+35*max(1,len(show))))
     if not show.empty:
         pick=st.selectbox("Review opportunity", show["Ticker"].tolist(), key="today_pick")
         st.button("Open Research", type="primary", on_click=nav_to, args=("Research",pick,"Summary"))
@@ -449,6 +605,106 @@ if area == "Today":
             if current_sig and t.direction=="BULLISH" and current_sig.score_at_prediction<-.2: msgs.append("signal flipped bearish")
             if current_sig and t.direction=="BEARISH" and current_sig.score_at_prediction>.2: msgs.append("signal flipped bullish")
             if msgs: st.warning(f"{t.ticker} · {t.strategy}: " + "; ".join(msgs))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KEY EVENTS — macro + earnings calendar
+# ─────────────────────────────────────────────────────────────────────────────
+elif area == "Key Events":
+    st.markdown("## Key Events")
+    st.caption("Economic calendar and upcoming basket earnings in one calendar view. Event times are shown in UTC.")
+
+    today = date.today()
+    months = []
+    for offset in range(-1, 7):
+        y = today.year + (today.month - 1 + offset) // 12
+        m = (today.month - 1 + offset) % 12 + 1
+        months.append((y, m))
+    labels = [datetime(y, m, 1).strftime("%B %Y") for y, m in months]
+    default_idx = next((i for i, (y,m) in enumerate(months) if y == today.year and m == today.month), 0)
+    chosen = st.selectbox("Calendar month", labels, index=default_idx)
+    year, month = months[labels.index(chosen)]
+
+    start_at = datetime(year, month, 1)
+    end_at = datetime(year + 1, 1, 1) if month == 12 else datetime(year, month + 1, 1)
+    events = key_events_between(start_at, end_at)
+    events_by_day: dict[int, list[dict]] = {}
+    for e in events:
+        events_by_day.setdefault(e["at"].day, []).append(e)
+
+    st.markdown(
+        '<div class="tv-small">ⓘ ECON = economic release / central-bank event · EARN = upcoming basket earnings.</div>',
+        unsafe_allow_html=True,
+    )
+
+    weekday_labels = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
+    hdr = st.columns(7)
+    for i, wd in enumerate(weekday_labels):
+        hdr[i].markdown(f"<div class='tv-kicker' style='text-align:center'>{wd}</div>", unsafe_allow_html=True)
+
+    cal = calendar.Calendar(firstweekday=0)
+    for week in cal.monthdayscalendar(year, month):
+        cols = st.columns(7)
+        for i, day_num in enumerate(week):
+            with cols[i]:
+                if day_num == 0:
+                    st.markdown("<div style='min-height:118px'></div>", unsafe_allow_html=True)
+                    continue
+                is_today = (year == today.year and month == today.month and day_num == today.day)
+                border = "border-color:#2962ff;" if is_today else ""
+                day_events = events_by_day.get(day_num, [])
+                pills = []
+                for e in day_events[:4]:
+                    cls = "tv-warn" if e["kind"] == "ECON" else "tv-blue"
+                    label = (e["ticker"] if e["kind"] == "EARN" else e["title"])[:18]
+                    pills.append(f"<div class='tv-pill {cls}' style='display:block;margin:4px 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap'>{e['kind']} · {label}</div>")
+                if len(day_events) > 4:
+                    pills.append(f"<div class='tv-small'>+{len(day_events)-4} more</div>")
+                st.markdown(
+                    f"<div class='tv-card' style='min-height:118px;{border}'><div class='tv-kicker'>{day_num}</div>{''.join(pills)}</div>",
+                    unsafe_allow_html=True,
+                )
+
+    st.markdown('<div class="tv-section">Event details</div>', unsafe_allow_html=True)
+    kind_filter = st.radio("Event type", ["All","Economic","Earnings"], horizontal=True, label_visibility="collapsed")
+    filtered = [
+        e for e in events
+        if kind_filter == "All"
+        or (kind_filter == "Economic" and e["kind"] == "ECON")
+        or (kind_filter == "Earnings" and e["kind"] == "EARN")
+    ]
+    if not filtered:
+        st.info("No stored events for this month.")
+    else:
+        detail_rows = []
+        for e in filtered:
+            detail_rows.append({
+                "Date": e["at"].strftime("%Y-%m-%d"),
+                "Time UTC": e["at"].strftime("%H:%M"),
+                "Type": "Economic" if e["kind"] == "ECON" else "Earnings",
+                "Event": e["title"],
+                "Importance": e["importance"],
+                "Consensus": e["consensus"] or "—",
+                "Prior": e["prior"] or "—",
+                "Actual": e["actual"] or "—",
+                "Source": e["source"],
+            })
+        event_df = pd.DataFrame(detail_rows)
+        dataframe_with_help(
+            event_df,
+            help_overrides={
+                "Date": metric_help("Event Date", "MktScan macro/earnings calendar", "Calendar date of the scheduled event.", "Events close to an intended trade horizon deserve explicit event-risk planning."),
+                "Time UTC": metric_help("Event Time", "MktScan macro/earnings calendar", "Scheduled event time stored in UTC.", "Translate it to your local workflow; earnings timestamps can be less precise than macro release times."),
+                "Type": metric_help("Event Type", "MktScan macro/earnings calendar", "Distinguishes macroeconomic events from company earnings.", "Macro events can affect the whole market; earnings are primarily ticker-specific but can move sectors."),
+                "Event": metric_help("Event", "MarketWatch/economic sources or Yahoo Finance earnings", "Name of the macro release or ticker earnings event.", "Use it to identify binary/event risk that may change volatility and invalidate normal signals."),
+                "Importance": metric_help("Importance", "Calendar source", "Source-provided event importance/category.", "Higher-importance macro events generally deserve more caution around entries and sizing."),
+                "Consensus": metric_help("Consensus", "Calendar source / analyst estimates", "Pre-event consensus estimate where available.", "The market reaction often depends on actual-vs-consensus and revisions, not merely the reported number."),
+                "Prior": metric_help("Prior", "Calendar source", "Previous reported value where available.", "Compare with consensus and actual to understand acceleration/deceleration."),
+                "Actual": metric_help("Actual", "Calendar source", "Reported result once available.", "Interpret relative to consensus, prior and market positioning; a beat can still produce a negative price reaction."),
+                "Source": metric_help("Source", "MktScan provenance metadata", "Upstream provider used for the stored event.", "Use provenance and freshness to judge confidence, especially when event times change."),
+            },
+            use_container_width=True,
+            hide_index=True,
+        )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # RESEARCH — one ticker, conclusion first, diagnostics on demand
@@ -543,7 +799,7 @@ elif area == "Research":
             st.info(f"Preferred expression: **{interp.structure_bias}**")
             with st.expander("Full volatility surface diagnostics"):
                 st.write(interp.term_view); st.write(interp.skew_view); st.write(interp.move_view)
-                st.dataframe(pd.DataFrame([{"30D IV":opt.iv_30d,"60D IV":opt.iv_60d,"90D IV":opt.iv_90d,"30→60":opt.term_slope_30_60,"60→90":opt.term_slope_60_90,"Put skew":opt.put_skew,"Call skew":opt.call_skew,"Source":opt.source,"Confidence":opt.confidence}]),use_container_width=True,hide_index=True)
+                dataframe_with_help(pd.DataFrame([{"30D IV":opt.iv_30d,"60D IV":opt.iv_60d,"90D IV":opt.iv_90d,"30→60":opt.term_slope_30_60,"60→90":opt.term_slope_60_90,"Put skew":opt.put_skew,"Call skew":opt.call_skew,"Source":opt.source,"Confidence":opt.confidence}]),use_container_width=True,hide_index=True)
             for c in interp.cautions: st.warning(c)
 
     elif section=="Trade Builder":
@@ -563,7 +819,7 @@ elif area == "Research":
                 legs=pd.DataFrame(setup.get("legs",[]))
                 if not legs.empty:
                     keep=[x for x in ["action","right","strike","expiry","bid","ask","fill","delta","theta","vega","open_interest","volume"] if x in legs.columns]
-                    st.dataframe(legs[keep],use_container_width=True,hide_index=True)
+                    dataframe_with_help(legs[keep],use_container_width=True,hide_index=True)
                 st.caption(f"Net Δ {setup.get('net_delta','—')} · Theta/day ${setup.get('net_theta_per_day_per_contract','—')} · Vega ${setup.get('net_vega_per_contract','—')}")
                 for w in setup.get("warnings",[]): st.warning(w)
                 st.button("Log this trade", type="primary", on_click=nav_to_journal, args=(ticker, setup.get("strategy", "")))
@@ -598,7 +854,7 @@ elif area == "Research":
     elif section=="Advanced":
         tech=technical_opportunity(ticker)
         st.markdown("### Advanced diagnostics")
-        st.dataframe(pd.DataFrame([tech.__dict__]),use_container_width=True,hide_index=True)
+        dataframe_with_help(pd.DataFrame([tech.__dict__]),use_container_width=True,hide_index=True)
         if p:
             st.markdown("#### Persisted price/fundamental snapshot")
             vals={k:v for k,v in p.__dict__.items() if not k.startswith("_")}
@@ -624,11 +880,11 @@ elif area == "Portfolio":
         if view=="Open Positions":
             marked=sum((trade_metrics(t,True).pnl or 0) for t in open_trades); risk=sum(float(t.planned_max_loss or 0) for t in open_trades)
             c1,c2,c3,c4=st.columns(4)
-            c1.metric("Open P&L",f"${marked:,.0f}"); c2.metric("Capital at Risk",f"${risk:,.0f}"); c3.metric("Positions",len(open_trades)); c4.metric("Net Bias",("Bullish" if sum(1 if t.direction=="BULLISH" else -1 for t in open_trades)>0 else "Bearish" if open_trades else "Flat"))
+            ui_metric(c1,"Open P&L",f"${marked:,.0f}"); ui_metric(c2,"Capital at Risk",f"${risk:,.0f}"); ui_metric(c3,"Positions",len(open_trades)); ui_metric(c4,"Net Bias",("Bullish" if sum(1 if t.direction=="BULLISH" else -1 for t in open_trades)>0 else "Bearish" if open_trades else "Flat"))
             rows=[]
             for t in open_trades:
                 m=trade_metrics(t,True); rows.append({"ID":t.id,"Ticker":t.ticker,"Strategy":t.strategy,"Direction":t.direction,"Opened":t.opened_at.date(),"Mark":t.current_value,"P&L":m.pnl,"ROR %":m.return_on_risk_pct,"Risk":t.planned_max_loss})
-            st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
+            dataframe_with_help(pd.DataFrame(rows),use_container_width=True,hide_index=True)
             if open_trades:
                 tid=st.selectbox("Manage position",[t.id for t in open_trades],format_func=lambda i: next(f"#{t.id} · {t.ticker} · {t.strategy}" for t in open_trades if t.id==i))
                 t=next(x for x in open_trades if x.id==tid)
@@ -653,7 +909,7 @@ elif area == "Portfolio":
             rdf=pd.DataFrame(rows)
             if rdf.empty: st.info("Log open trades to populate portfolio risk.")
             else:
-                st.dataframe(rdf.sort_values("Risk $",ascending=False),use_container_width=True,hide_index=True)
+                dataframe_with_help(rdf.sort_values("Risk $",ascending=False),use_container_width=True,hide_index=True)
                 by=rdf.groupby("Ticker",as_index=False)["Risk $"].sum().sort_values("Risk $",ascending=False)
                 for _,row in by.iterrows():
                     pct=row["Risk $"]/risk*100 if risk else 0
@@ -683,7 +939,7 @@ elif area == "Portfolio":
                 rows=[]
                 for t in trades:
                     m=trade_metrics(t,t.status=="OPEN"); rows.append({"ID":t.id,"Date":t.opened_at.date(),"Ticker":t.ticker,"Strategy":t.strategy,"Status":t.status,"P&L":m.pnl if t.status=="OPEN" else t.realized_pnl,"ROR %":m.return_on_risk_pct if t.status=="OPEN" else t.return_on_risk_pct,"Regime":t.regime_label,"IV Pct":t.iv_percentile,"Signal":t.tradeability_label})
-                st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
+                dataframe_with_help(pd.DataFrame(rows),use_container_width=True,hide_index=True)
             else:
                 if not closed: st.info("Close trades to unlock attribution reviews.")
                 else:
@@ -698,7 +954,7 @@ elif area == "Portfolio":
                     elif not direction_ok and pnl<=0: diagnosis="DIRECTIONAL THESIS ERROR"
                     else: diagnosis="P&L POSITIVE DESPITE THESIS"
                     st.markdown(f"### {diagnosis}")
-                    c1,c2,c3=st.columns(3); c1.metric("Underlying return",f"{underlying_ret:+.1f}%" if underlying_ret is not None else "—"); c2.metric("Trade P&L",f"${pnl:,.0f}"); c3.metric("Return on risk",f"{t.return_on_risk_pct:+.1f}%" if t.return_on_risk_pct is not None else "—")
+                    c1,c2,c3=st.columns(3); ui_metric(c1,"Underlying return",f"{underlying_ret:+.1f}%" if underlying_ret is not None else "—"); ui_metric(c2,"Trade P&L",f"${pnl:,.0f}"); ui_metric(c3,"Return on risk",f"{t.return_on_risk_pct:+.1f}%" if t.return_on_risk_pct is not None else "—")
                     st.caption(f"Entry signal {t.tradeability_label or '—'} · regime {t.regime_label or '—'} · IV pct {t.iv_percentile if t.iv_percentile is not None else '—'}")
     finally:
         s.close()
@@ -716,7 +972,7 @@ elif area == "Validation":
             closed=s.execute(select(TradeJournalEntry).where(TradeJournalEntry.status=="CLOSED").order_by(TradeJournalEntry.closed_at)).scalars().all()
             pnls=[float(t.realized_pnl or 0) for t in closed]; wins=[x for x in pnls if x>0]; losses=[x for x in pnls if x<0]
             net=sum(pnls); winrate=(len(wins)/len(pnls)*100) if pnls else None; pf=(sum(wins)/abs(sum(losses))) if losses else None; expectancy=(net/len(pnls)) if pnls else None
-            c1,c2,c3,c4=st.columns(4); c1.metric("Net P&L",f"${net:,.0f}"); c2.metric("Trades",len(pnls)); c3.metric("Win Rate",f"{winrate:.1f}%" if winrate is not None else "—"); c4.metric("Profit Factor",f"{pf:.2f}" if pf is not None else "—")
+            c1,c2,c3,c4=st.columns(4); ui_metric(c1,"Net P&L",f"${net:,.0f}"); ui_metric(c2,"Trades",len(pnls)); ui_metric(c3,"Win Rate",f"{winrate:.1f}%" if winrate is not None else "—"); ui_metric(c4,"Profit Factor",f"{pf:.2f}" if pf is not None else "—")
             if pnls:
                 curve=pd.DataFrame({"Trade":range(1,len(pnls)+1),"Cumulative P&L":pd.Series(pnls).cumsum()})
                 st.line_chart(curve.set_index("Trade"),height=300)
@@ -726,17 +982,17 @@ elif area == "Validation":
             if not rows: st.info("No resolved forward outcomes yet.")
             else:
                 n=len(rows); acc=sum(1 for r in rows if r.direction_correct)/n*100
-                c1,c2=st.columns(2); c1.metric("Resolved signals",n); c2.metric("Directional accuracy",f"{acc:.1f}%")
+                c1,c2=st.columns(2); ui_metric(c1,"Resolved signals",n); ui_metric(c2,"Directional accuracy",f"{acc:.1f}%")
                 df=pd.DataFrame([{"Ticker":r.ticker,"Score":r.score_at_prediction,"Return %":r.actual_return_pct,"Correct":r.direction_correct,"Regime":r.regime_label_at_prediction} for r in rows])
                 df["Score bucket"]=pd.cut(df["Score"],[-1,-.5,-.2,.2,.5,1],labels=["Strong Bear","Bear","Neutral","Bull","Strong Bull"])
                 cal=df.groupby("Score bucket",observed=True).agg(N=("Ticker","size"),Avg_Return=("Return %","mean"),Accuracy=("Correct","mean")).reset_index(); cal["Accuracy"]*=100
-                st.dataframe(cal,use_container_width=True,hide_index=True)
+                dataframe_with_help(cal,use_container_width=True,hide_index=True)
         elif view=="Backtest":
             try:
                 from mktscan.backtest_incremental import BacktestObservation, BacktestSummary
                 sums=s.execute(select(BacktestSummary).order_by(BacktestSummary.label,BacktestSummary.holding_days)).scalars().all()
                 if sums:
-                    st.dataframe(pd.DataFrame([{"Label":r.label,"Days":r.holding_days,"N":r.n_observations,"Avg Return %":r.avg_return_pct,"Excess %":r.excess_return_pct,"Win Rate %":r.win_rate_pct,"Option P&L %":r.option_avg_pnl_pct,"Option Win %":r.option_win_rate} for r in sums]),use_container_width=True,hide_index=True)
+                    dataframe_with_help(pd.DataFrame([{"Label":r.label,"Days":r.holding_days,"N":r.n_observations,"Avg Return %":r.avg_return_pct,"Excess %":r.excess_return_pct,"Win Rate %":r.win_rate_pct,"Option P&L %":r.option_avg_pnl_pct,"Option Win %":r.option_win_rate} for r in sums]),use_container_width=True,hide_index=True)
                 else: st.info("Backtest summary is empty. Run the incremental backtest first.")
             except Exception as e: st.error(f"Backtest data unavailable: {e}")
         else:
@@ -746,12 +1002,12 @@ elif area == "Validation":
                 df=pd.DataFrame([{"Ticker":t.ticker,"Strategy":t.strategy,"P&L":t.realized_pnl or 0,"ROR":t.return_on_risk_pct,"Regime":t.regime_label or "Unknown","IV Pct":t.iv_percentile,"Signal":t.tradeability_label or "Unknown"} for t in closed])
                 left,right=st.columns(2)
                 with left:
-                    st.markdown("#### By strategy"); st.dataframe(df.groupby("Strategy").agg(N=("Ticker","size"),PnL=("P&L","sum"),Avg_ROR=("ROR","mean")).reset_index().sort_values("PnL",ascending=False),use_container_width=True,hide_index=True)
+                    st.markdown("#### By strategy"); dataframe_with_help(df.groupby("Strategy").agg(N=("Ticker","size"),PnL=("P&L","sum"),Avg_ROR=("ROR","mean")).reset_index().sort_values("PnL",ascending=False),use_container_width=True,hide_index=True)
                 with right:
-                    st.markdown("#### By market regime"); st.dataframe(df.groupby("Regime").agg(N=("Ticker","size"),PnL=("P&L","sum"),Avg_ROR=("ROR","mean")).reset_index().sort_values("PnL",ascending=False),use_container_width=True,hide_index=True)
+                    st.markdown("#### By market regime"); dataframe_with_help(df.groupby("Regime").agg(N=("Ticker","size"),PnL=("P&L","sum"),Avg_ROR=("ROR","mean")).reset_index().sort_values("PnL",ascending=False),use_container_width=True,hide_index=True)
                 if df["IV Pct"].notna().any():
                     df["IV Bucket"]=pd.cut(df["IV Pct"],[-1,20,40,60,80,101],labels=["<20","20-40","40-60","60-80","80+"])
                     st.markdown("#### By IV percentile")
-                    st.dataframe(df.groupby("IV Bucket",observed=True).agg(N=("Ticker","size"),PnL=("P&L","sum"),Avg_ROR=("ROR","mean")).reset_index(),use_container_width=True,hide_index=True)
+                    dataframe_with_help(df.groupby("IV Bucket",observed=True).agg(N=("Ticker","size"),PnL=("P&L","sum"),Avg_ROR=("ROR","mean")).reset_index(),use_container_width=True,hide_index=True)
     finally:
         s.close()

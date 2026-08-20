@@ -24,3 +24,11 @@ The Research page generates structured prompts from the current MktScan context.
 ## Deployment
 
 No database migration is required. Deploy `dashboard/app.py` with the rest of the current repository. Existing Railway dashboard/scheduler role separation remains unchanged.
+
+
+## v2.1 — Metric provenance, Key Events, Treasury tracker
+
+- Every summary metric and the primary decision tables expose a tooltip with **Source**, **Definition**, and **How to interpret**.
+- Added **Key Events** navigation with a monthly calendar combining persisted economic-calendar events and upcoming basket earnings.
+- Replaced the Today-page "Next Event" card with near-real-time **10Y** and **30Y U.S. Treasury yield** trackers using Yahoo Finance CBOE yield indexes (`^TNX`, `^TYX`), with a persisted MktScan fallback for 10Y.
+- Treasury values are cached for 60 seconds; availability/latency depends on Yahoo Finance market-data availability.
