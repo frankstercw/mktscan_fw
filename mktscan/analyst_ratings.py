@@ -172,12 +172,75 @@ def upsert_analyst_events(session: Session, items: list[dict[str, Any]]) -> dict
         row.pt_current = item.get("pt_current")
         row.importance = item.get("importance")
         row.url = item.get("url")
-        row.source = "benzinga"
+        row.source = item.get("source") or "benzinga"
         row.raw_json = json.dumps(item.get("raw") or {}, default=str)
         row.updated_at = datetime.utcnow()
 
     session.commit()
     return {"inserted": inserted, "updated": updated}
+
+
+def fetch_yahoo_analyst_events(ticker: str, *, lookback_days: int = 45) -> list[dict[str, Any]]:
+    """Fallback analyst actions from yfinance when Benzinga is unavailable.
+
+    This keeps the dashboard useful without pretending Yahoo is Benzinga:
+    persisted rows carry source='yahoo'. Yahoo does not reliably expose
+    historical price-target revisions, so those fields can be empty.
+    """
+    try:
+        import pandas as pd
+        import yfinance as yf
+
+        frame = yf.Ticker(ticker).upgrades_downgrades
+        if frame is None or frame.empty:
+            return []
+        df = frame.reset_index()
+        date_col = next((c for c in df.columns if str(c).lower() in {"gradedate", "date", "index"}), df.columns[0])
+        cutoff = datetime.utcnow() - timedelta(days=lookback_days)
+        out = []
+        for _, row in df.iterrows():
+            raw_dt = row.get(date_col)
+            try:
+                published = pd.to_datetime(raw_dt, utc=True).to_pydatetime().replace(tzinfo=None)
+            except Exception:
+                continue
+            if published < cutoff:
+                continue
+            firm = row.get("Firm") or row.get("firm") or ""
+            action_raw = str(row.get("Action") or row.get("action") or "")
+            action_map = {
+                "up": "Upgrades",
+                "down": "Downgrades",
+                "init": "Initiates",
+                "reit": "Reiterates",
+                "main": "Maintains",
+            }
+            action = action_map.get(action_raw.strip().lower(), action_raw)
+            from_grade = row.get("FromGrade") or row.get("fromGrade") or ""
+            to_grade = row.get("ToGrade") or row.get("toGrade") or ""
+            key = hashlib.sha1(
+                f"yahoo|{ticker}|{published}|{firm}|{action}|{from_grade}|{to_grade}".encode()
+            ).hexdigest()
+            out.append({
+                "external_id": key,
+                "ticker": ticker.upper(),
+                "published_at": published,
+                "firm": str(firm),
+                "analyst_name": "",
+                "action_company": str(action),
+                "action_pt": "",
+                "rating_prior": str(from_grade),
+                "rating_current": str(to_grade),
+                "pt_prior": None,
+                "pt_current": None,
+                "importance": None,
+                "url": "",
+                "source": "yahoo",
+                "raw": {str(k): (None if getattr(v, "__class__", None).__name__ == "NAType" else str(v)) for k, v in row.items()},
+            })
+        return out
+    except Exception:
+        return []
 
 
 def refresh_analyst_ratings(
@@ -186,36 +249,56 @@ def refresh_analyst_ratings(
     *,
     lookback_days: int = 35,
 ) -> dict[str, Any]:
+    """Refresh analyst events.
+
+    Benzinga is primary. If the key is absent, the entitlement rejects the
+    request, or it returns no rows, Yahoo upgrades/downgrades are used as an
+    explicitly-labeled fallback so the dashboard does not silently stay empty.
+    """
     cfg = get_config()
     bz_cfg = dict(cfg.get("sources", {}).get("benzinga", {}))
     api_key = bz_cfg.get("api_key")
-    if not api_key:
-        return {
-            "enabled": False,
-            "reason": "MKTSCAN_BENZINGA_KEY is not configured",
-            "tickers": 0,
-            "events": 0,
-            "inserted": 0,
-        }
-
     wanted = tickers or analyst_watch_tickers(session)
-    from .scrapers.benzinga import BenzingaScraper
-    scraper = BenzingaScraper(bz_cfg, delay=0.15, lookback_days=lookback_days)
+
     all_items: list[dict[str, Any]] = []
     errors: list[str] = []
+    provider = "benzinga"
 
-    for ticker in wanted:
+    if api_key and not str(api_key).startswith("YOUR_"):
         try:
-            all_items.extend(scraper.fetch_ratings(ticker, lookback_days=lookback_days))
+            from .scrapers.benzinga import BenzingaScraper
+            scraper = BenzingaScraper(bz_cfg, delay=0.10, lookback_days=lookback_days)
+            # Benzinga supports up to 50 comma-separated tickers, which is
+            # faster and less rate-limit-prone than one request per ticker.
+            for i in range(0, len(wanted), 50):
+                chunk = wanted[i:i + 50]
+                try:
+                    all_items.extend(
+                        scraper.fetch_ratings(",".join(chunk), lookback_days=lookback_days, max_items=1000)
+                    )
+                except Exception as exc:
+                    errors.append(f"Benzinga {','.join(chunk)}: {exc}")
         except Exception as exc:
-            errors.append(f"{ticker}: {exc}")
+            errors.append(f"Benzinga initialization: {exc}")
+    else:
+        errors.append("MKTSCAN_BENZINGA_KEY is not configured")
+
+    # A valid Benzinga key can still lack the Analyst Ratings entitlement. The
+    # scraper logs that HTTP error; if no rows came back, fall back to Yahoo.
+    if not all_items:
+        provider = "yahoo_fallback"
+        for ticker in wanted:
+            items = fetch_yahoo_analyst_events(ticker, lookback_days=max(lookback_days, 45))
+            all_items.extend(items)
 
     stats = upsert_analyst_events(session, all_items) if all_items else {"inserted": 0, "updated": 0}
     return {
         "enabled": True,
+        "provider": provider,
         "tickers": len(wanted),
         "events": len(all_items),
         "inserted": stats["inserted"],
         "updated": stats["updated"],
         "errors": errors,
+        "benzinga_configured": bool(api_key and not str(api_key).startswith("YOUR_")),
     }

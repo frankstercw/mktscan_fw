@@ -571,3 +571,7 @@ These presentation layers do not change the underlying tradeability model weight
 ## Analyst Ratings v1
 
 Set `MKTSCAN_BENZINGA_KEY` on the scheduler service to enable Benzinga analyst-rating ingestion. MktScan refreshes basket + open-position tickers every 15 minutes during the U.S. regular session, stores rating/price-target actions, calculates a 30-day Analyst Momentum state, surfaces actions in Research and What's Changed, and snapshots the state into new Trade Journal entries.
+
+
+## Dashboard v2.4
+- Simplified Today cards, restored rolling basket Market Performance, hardened Key Events economic-calendar ingestion, and fixed/diagnosed Analyst Ratings ingestion with Yahoo fallback.

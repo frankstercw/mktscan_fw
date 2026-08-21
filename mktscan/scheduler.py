@@ -172,7 +172,7 @@ def run_scheduled(cfg: dict[str, Any] | None = None, interval_minutes: int | Non
             console.print(f"[yellow]⚠ IV snapshot update failed: {iv_err}[/yellow]")
             log.warning(f"IV snapshot update failed: {iv_err}")
 
-    def analyst_ratings_job():
+    def analyst_ratings_job(force: bool = False):
         """Refresh Benzinga analyst actions for basket + open journal positions.
 
         The APScheduler trigger runs every configured quarter-hour between
@@ -183,7 +183,7 @@ def run_scheduled(cfg: dict[str, Any] | None = None, interval_minutes: int | Non
         from zoneinfo import ZoneInfo
 
         now_et = _datetime.now(ZoneInfo("America/New_York"))
-        if not (_time(9, 30) <= now_et.time().replace(tzinfo=None) <= _time(16, 0)):
+        if not force and not (_time(9, 30) <= now_et.time().replace(tzinfo=None) <= _time(16, 0)):
             return
 
         console.print("[cyan]▶ Analyst ratings refresh...[/cyan]")
@@ -207,7 +207,8 @@ def run_scheduled(cfg: dict[str, Any] | None = None, interval_minutes: int | Non
                 f"[green]✓ Analyst ratings refreshed[/green] — "
                 f"{result.get('tickers', 0)} tickers, "
                 f"{result.get('events', 0)} events, "
-                f"{result.get('inserted', 0)} new"
+                f"{result.get('inserted', 0)} new, "
+                f"provider={result.get('provider', 'unknown')}"
             )
             for err in result.get("errors", [])[:3]:
                 console.print(f"  [yellow]⚠ {err}[/yellow]")
@@ -325,8 +326,9 @@ def run_scheduled(cfg: dict[str, Any] | None = None, interval_minutes: int | Non
         analyst_ratings_job,
         trigger="date",
         run_date=_dt.utcnow() + _td(seconds=35),
+        args=[True],
         id="mktscan_analyst_startup",
-        name="MktScan analyst ratings startup check",
+        name="MktScan analyst ratings startup seed",
         misfire_grace_time=600,
     )
 

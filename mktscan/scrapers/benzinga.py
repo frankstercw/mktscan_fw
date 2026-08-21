@@ -48,6 +48,12 @@ class BenzingaScraper:
         r.raise_for_status()
         return r.json()
 
+    def _get_url(self, url: str, params: dict) -> Any:
+        params["token"] = self.api_key
+        r = self.session.get(url, params=params, timeout=15)
+        r.raise_for_status()
+        return r.json()
+
     def fetch_news(self, ticker: str, max_articles: int = 50) -> list[dict]:
         """Fetch recent news articles mentioning the ticker."""
         results = []
@@ -90,7 +96,7 @@ class BenzingaScraper:
         try:
             data = self._get("calendar/earnings", {
                 "parameters[tickers]": ticker,
-                "parameters[dateFrom]": date_from,
+                "parameters[date_from]": date_from,
                 "parameters[dateTo]":   date_to,
             })
 
@@ -127,8 +133,8 @@ class BenzingaScraper:
         try:
             data = self._get("calendar/ratings", {
                 "parameters[tickers]": ticker,
-                "parameters[dateFrom]": date_from,
-                "parameters[dateTo]": date_to,
+                "parameters[date_from]": date_from,
+                "parameters[date_to]": date_to,
                 "pagesize": min(max_items, 1000),
             })
 
@@ -176,6 +182,63 @@ class BenzingaScraper:
             time.sleep(self.delay)
 
         return results
+
+    def fetch_economic_calendar(
+        self,
+        date_from: datetime | None = None,
+        date_to: datetime | None = None,
+        *,
+        country: str = "USA",
+        min_importance: int = 1,
+    ) -> list[dict]:
+        """Benzinga Economic Calendar fallback.
+
+        Benzinga currently documents this dataset under API v2.1.
+        """
+        from zoneinfo import ZoneInfo
+        from datetime import timezone
+
+        start = date_from or datetime.utcnow()
+        end = date_to or (start + timedelta(days=21))
+        url = self.base_url.replace("/api/v2", "/api/v2.1").rstrip("/") + "/calendar/economics"
+        try:
+            data = self._get_url(url, {
+                "parameters[date_from]": start.strftime("%Y-%m-%d"),
+                "parameters[date_to]": end.strftime("%Y-%m-%d"),
+                "parameters[importance]": int(min_importance),
+                "country": country,
+                "pagesize": 1000,
+            })
+            items = data.get("economics", []) if isinstance(data, dict) else []
+            out = []
+            eastern = ZoneInfo("America/New_York")
+            for item in items:
+                d = str(item.get("date") or "")
+                t = str(item.get("time") or "00:00:00")
+                try:
+                    local = datetime.strptime(f"{d} {t}", "%Y-%m-%d %H:%M:%S").replace(tzinfo=eastern)
+                    event_dt = local.astimezone(timezone.utc).replace(tzinfo=None)
+                except Exception:
+                    event_dt = self._parse_date(d)
+                imp_num = self._safe_int(item.get("importance")) or 1
+                importance = "High" if imp_num >= 3 else "Medium" if imp_num == 2 else "Low"
+                out.append({
+                    "date": event_dt.date() if event_dt else None,
+                    "datetime": event_dt,
+                    "time_str": t,
+                    "name": item.get("event_name") or "",
+                    "period": item.get("event_period") or "",
+                    "consensus": item.get("consensus") or "",
+                    "prior": item.get("prior") or "",
+                    "actual": item.get("actual") or "",
+                    "category": item.get("event_category") or "Economic",
+                    "importance": importance,
+                    "source": "benzinga_economics",
+                })
+            return out
+        except Exception as exc:
+            log.error(f"[Benzinga] Economic calendar failed: {exc}")
+            return []
 
     @staticmethod
     def _safe_float(val) -> float | None:

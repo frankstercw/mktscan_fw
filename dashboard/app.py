@@ -707,6 +707,38 @@ def build_decision(ticker: str, sig, regime, tech, opt, earn) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+
+@st.cache_data(ttl=900, show_spinner=False)
+def market_performance_history(tickers: tuple[str, ...], trading_days: int = 14):
+    """Old-dashboard-style rolling daily performance table for the full basket."""
+    import yfinance as yf
+
+    if not tickers:
+        return None, None
+    end = date.today()
+    start = end - timedelta(days=35)
+    raw = yf.download(
+        list(tickers),
+        start=str(start),
+        end=str(end + timedelta(days=1)),
+        progress=False,
+        auto_adjust=True,
+        group_by="column",
+        threads=True,
+    )
+    if raw is None or raw.empty:
+        return None, None
+    if isinstance(raw.columns, pd.MultiIndex):
+        closes = raw["Close"]
+    else:
+        closes = raw[["Close"]].rename(columns={"Close": tickers[0]})
+    closes = closes.dropna(how="all").tail(trading_days)
+    if closes.empty:
+        return None, None
+    pct = closes.pct_change() * 100.0
+    return pct.iloc[1:], closes.iloc[-1]
+
+
 # Global context + four-area navigation
 # ─────────────────────────────────────────────────────────────────────────────
 basket_symbols = basket_tickers()
@@ -721,7 +753,7 @@ if custom_ticker and custom_ticker not in tickers:
 
 if st.session_state.get("global_ticker") not in tickers:
     st.session_state["global_ticker"] = tickers[0]
-if st.session_state.get("area") not in {"Today", "Research", "Key Events", "Portfolio", "Validation"}:
+if st.session_state.get("area") not in {"Today", "Market Performance", "Research", "Key Events", "Portfolio", "Validation"}:
     st.session_state["area"] = "Today"
 
 with st.sidebar:
@@ -733,7 +765,7 @@ with st.sidebar:
         st.error(st.session_state["ticker_lookup_error"])
     st.caption("Ad-hoc symbols run on demand and are not added to the scheduled basket.")
     st.selectbox("Ticker", tickers, key="global_ticker")
-    st.radio("", ["Today", "Research", "Key Events", "Portfolio", "Validation"], key="area", label_visibility="collapsed")
+    st.radio("", ["Today", "Market Performance", "Research", "Key Events", "Portfolio", "Validation"], key="area", label_visibility="collapsed")
     st.divider()
     fresh = data_freshness()
     st.caption("DATA FRESHNESS")
@@ -779,17 +811,15 @@ if area == "Today":
     capital_risk = sum(float(t.planned_max_loss or 0) for t in open_trades)
     treasuries = live_treasury_yields()
 
-    c1,c2,c3,c4,c5,c6 = st.columns(6)
+    c1,c2,c3,c4 = st.columns(4)
     with c1: card("Market", regime.regime_label if regime else "UNKNOWN", f"confidence {(regime.confidence or 0):.0%}" if regime else "", signal_color(regime.regime_label if regime else ""))
     with c2: card("VIX", f"{regime.vix:.1f}" if regime and regime.vix is not None else "—", regime.volatility_state if regime else "")
-    with c3: card("Open P&L", f"${marked_pnl:,.0f}", f"{len(open_trades)} open positions", "tv-bull" if marked_pnl >= 0 else "tv-bear")
-    with c4: card("Capital at Risk", f"${capital_risk:,.0f}", "journal planned max loss")
-    with c5:
+    with c3:
         t10 = treasuries.get("10Y", {})
         y10 = t10.get("yield")
         d10 = t10.get("delta_bps")
         card("10Y Treasury", f"{y10:.3f}%" if y10 is not None else "—", f"{d10:+.1f} bps vs prev close" if d10 is not None else "near-real-time")
-    with c6:
+    with c4:
         t30 = treasuries.get("30Y", {})
         y30 = t30.get("yield")
         d30 = t30.get("delta_bps")
@@ -888,6 +918,96 @@ if area == "Today":
             if msgs: st.warning(f"{t.ticker} · {t.strategy}: " + "; ".join(msgs))
 
 # ─────────────────────────────────────────────────────────────────────────────
+# MARKET PERFORMANCE — rolling 2-week basket history
+# ─────────────────────────────────────────────────────────────────────────────
+elif area == "Market Performance":
+    st.markdown("## Market Performance")
+    st.caption("Rolling daily performance across the entire configured basket. Yahoo Finance adjusted daily prices; cached for 15 minutes.")
+
+    with st.spinner("Loading basket price history…"):
+        pct_df, last_prices = market_performance_history(tuple(basket_symbols), trading_days=14)
+
+    if pct_df is None or pct_df.empty:
+        st.info("Price history is temporarily unavailable.")
+    else:
+        cols_ordered = [t for t in basket_symbols if t in pct_df.columns]
+        pct_df = pct_df[cols_ordered]
+        dates_fmt = [d.strftime("%b %d") for d in pct_df.index]
+
+        fig_heat = go.Figure(go.Heatmap(
+            z=pct_df.values.tolist(),
+            x=cols_ordered,
+            y=dates_fmt,
+            colorscale=[
+                [0.0, "#ef4444"],
+                [0.35, "#fca5a5"],
+                [0.50, "#131722"],
+                [0.65, "#86efac"],
+                [1.0, "#22d3a0"],
+            ],
+            zmid=0,
+            zmin=-5,
+            zmax=5,
+            text=[[f"{v:+.2f}%" if pd.notna(v) else "—" for v in row] for row in pct_df.values.tolist()],
+            texttemplate="%{text}",
+            textfont=dict(size=11),
+            hovertemplate="<b>%{x}</b> · %{y}<br>Daily change: %{text}<extra></extra>",
+            colorbar=dict(title="% Chg", ticksuffix="%", thickness=12, len=0.8),
+        ))
+        fig_heat.update_layout(
+            height=max(360, len(dates_fmt) * 28),
+            margin=dict(l=10, r=60, t=10, b=10),
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            font=dict(color="#94a3b8"),
+            xaxis=dict(side="top", tickangle=0),
+            yaxis=dict(autorange="reversed"),
+        )
+        st.plotly_chart(fig_heat, use_container_width=True)
+
+        rows = []
+        for tk in cols_ordered:
+            series = pct_df[tk].dropna()
+            if series.empty:
+                continue
+            total = ((1 + series / 100.0).prod() - 1) * 100.0
+            rows.append({
+                "Ticker": tk,
+                "Last Price": float(last_prices[tk]) if last_prices is not None and tk in last_prices.index and pd.notna(last_prices[tk]) else None,
+                "2W Return %": total,
+                "Up Days": int((series > 0).sum()),
+                "Down Days": int((series < 0).sum()),
+                "Best Day %": float(series.max()),
+                "Worst Day %": float(series.min()),
+                "Avg Daily %": float(series.mean()),
+            })
+        summary_df = pd.DataFrame(rows).sort_values("2W Return %", ascending=False)
+
+        st.markdown('<div class="tv-section">2-week ranking</div>', unsafe_allow_html=True)
+        dataframe_with_help(
+            summary_df,
+            help_overrides={
+                "Ticker": "Source: MktScan configured basket. Definition: Security symbol. How to interpret: Compare each name against peers in the same basket.",
+                "Last Price": "Source: Yahoo Finance adjusted daily close. Definition: Most recent adjusted close in this history. How to interpret: End-of-day reference price, not an intraday quote.",
+                "2W Return %": "Source: Yahoo Finance adjusted daily closes. Definition: Compounded return over the displayed rolling window. How to interpret: Higher positive values identify recent leaders; large negatives identify laggards.",
+                "Up Days": "Source: Yahoo Finance. Definition: Positive-return sessions in the window. How to interpret: Many up days suggest persistent participation rather than one isolated gap.",
+                "Down Days": "Source: Yahoo Finance. Definition: Negative-return sessions in the window. How to interpret: Persistent down days can reveal weakness hidden by one large rebound.",
+                "Best Day %": "Source: Yahoo Finance. Definition: Largest daily gain in the window. How to interpret: A very large best day can indicate catalyst-driven or unstable performance.",
+                "Worst Day %": "Source: Yahoo Finance. Definition: Largest daily loss in the window. How to interpret: Useful quick read of recent downside shock risk.",
+                "Avg Daily %": "Source: Yahoo Finance. Definition: Arithmetic average daily return. How to interpret: Helps distinguish sustained drift from a return dominated by one outlier day.",
+            },
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        with st.expander("ⓘ How to interpret Market Performance"):
+            st.markdown(
+                "**Heatmap:** green = positive day, red = negative day. Look for repeated clusters rather than one isolated cell.\n\n"
+                "**2W Return + Up Days:** together they separate persistent momentum from a single event-driven gap.\n\n"
+                "**Best/Worst Day:** highlights names whose recent return path is unusually volatile."
+            )
+
+# ─────────────────────────────────────────────────────────────────────────────
 # KEY EVENTS — macro + earnings calendar
 # ─────────────────────────────────────────────────────────────────────────────
 elif area == "Key Events":
@@ -896,24 +1016,30 @@ elif area == "Key Events":
 
     k1, k2 = st.columns([1, 3])
     with k1:
-        if st.button("Refresh MarketWatch", use_container_width=True):
+        if st.button("Refresh Economic Calendar", use_container_width=True):
             try:
-                from mktscan.scrapers.marketwatch import MarketWatchScraper
-                from mktscan.macro import upsert_macro_events
+                from mktscan.macro import refresh_economic_calendar
                 s = get_session()
                 try:
-                    with st.spinner("Refreshing MarketWatch economic calendar…"):
-                        events_now = MarketWatchScraper({"enabled": True}, delay=0.0).fetch_economic_calendar()
-                        saved = upsert_macro_events(s, events_now)
-                    st.success(f"MarketWatch: {len(events_now)} events refreshed ({saved} new).")
+                    with st.spinner("Refreshing economic calendar…"):
+                        result = refresh_economic_calendar(s)
+                    total = result.get("marketwatch_events", 0) + result.get("benzinga_events", 0)
+                    source = result.get("source") or "none"
+                    if total:
+                        st.success(f"Economic calendar: {total} events refreshed via {source}.")
+                    else:
+                        st.warning(
+                            "No economic events were returned. MarketWatch may be blocking the Railway IP; "
+                            "the Benzinga fallback also requires an Economic Calendar entitlement."
+                        )
                 finally:
                     s.close()
                 st.cache_data.clear()
                 st.rerun()
             except Exception as exc:
-                st.error(f"MarketWatch refresh failed: {exc}")
+                st.error(f"Economic-calendar refresh failed: {exc}")
     with k2:
-        st.caption("The scheduler also refreshes this calendar during regular MktScan runs.")
+        st.caption("MarketWatch is primary. If it returns no rows, MktScan falls back to Benzinga Economics when the configured key has that entitlement.")
 
     today = date.today()
     months = []
@@ -928,7 +1054,35 @@ elif area == "Key Events":
 
     start_at = datetime(year, month, 1)
     end_at = datetime(year + 1, 1, 1) if month == 12 else datetime(year, month + 1, 1)
+
+    # Self-heal an empty economic calendar instead of silently rendering a
+    # blank page. MarketWatch is primary; Benzinga Economics is a fallback
+    # when configured and MarketWatch is unavailable.
+    s = get_session()
+    try:
+        econ_count = s.execute(
+            select(func.count(MacroEvent.id)).where(
+                MacroEvent.event_at >= start_at,
+                MacroEvent.event_at < end_at,
+            )
+        ).scalar_one()
+        calendar_refresh_result = None
+        if not econ_count:
+            from mktscan.macro import refresh_economic_calendar
+            with st.spinner("Loading economic calendar…"):
+                calendar_refresh_result = refresh_economic_calendar(s)
+            key_events_between.clear()
+    finally:
+        s.close()
+
     events = key_events_between(start_at, end_at)
+    if calendar_refresh_result and not any(e["kind"] == "ECON" for e in events):
+        st.warning(
+            "Economic calendar is still empty. MarketWatch returned "
+            f"{calendar_refresh_result.get('marketwatch_events', 0)} events and the "
+            f"Benzinga fallback returned {calendar_refresh_result.get('benzinga_events', 0)}. "
+            "Check Railway outbound access and, if using the fallback, the Benzinga Economic Calendar entitlement."
+        )
     major_only = st.toggle(
         "Major macro events only",
         value=True,
@@ -1192,9 +1346,57 @@ elif area == "Research":
             for c in interp.cautions: st.warning(c)
 
     elif section=="Analyst Activity":
-        events, momentum = analyst_activity(ticker, 90)
         st.markdown("### Analyst Activity")
-        st.caption("Benzinga sell-side rating and price-target actions. Analyst Momentum is a catalyst/confirmation layer and is not included in Tradeability yet.")
+        st.caption("Benzinga is the primary ratings source; Yahoo upgrades/downgrades are used as an explicitly labeled fallback if Benzinga is unavailable or not entitled.")
+
+        r1, r2 = st.columns([1, 4])
+        with r1:
+            if st.button("Refresh analyst data", use_container_width=True):
+                try:
+                    from mktscan.analyst_ratings import refresh_analyst_ratings
+                    s = get_session()
+                    try:
+                        result = refresh_analyst_ratings(s, [ticker], lookback_days=45)
+                    finally:
+                        s.close()
+                    analyst_activity.clear()
+                    if result.get("events"):
+                        st.success(
+                            f"{result['events']} events refreshed via {result.get('provider', 'unknown')} "
+                            f"({result.get('inserted', 0)} new)."
+                        )
+                    else:
+                        st.warning(
+                            "No analyst events returned from Benzinga or Yahoo. "
+                            "Check the ticker, MKTSCAN_BENZINGA_KEY, and Benzinga Analyst Ratings entitlement."
+                        )
+                    if result.get("errors"):
+                        with st.expander("Provider diagnostics"):
+                            for err in result["errors"]:
+                                st.code(err)
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Analyst refresh failed: {exc}")
+        with r2:
+            st.caption("Scheduler refresh: every 15 minutes during the U.S. regular session; universe = basket + open journal positions.")
+
+        events, momentum = analyst_activity(ticker, 90)
+        source_counts = {}
+        if events:
+            s = get_session()
+            try:
+                rows = s.execute(
+                    select(AnalystRatingEvent.source, func.count(AnalystRatingEvent.id))
+                    .where(
+                        AnalystRatingEvent.ticker == ticker,
+                        AnalystRatingEvent.published_at >= datetime.utcnow() - timedelta(days=90),
+                    )
+                    .group_by(AnalystRatingEvent.source)
+                ).all()
+                source_counts = {str(src): int(n) for src, n in rows}
+            finally:
+                s.close()
+            st.caption("Stored sources: " + " · ".join(f"{k}: {v}" for k, v in source_counts.items()))
 
         c1,c2,c3,c4,c5,c6=st.columns(6)
         with c1: card("Analyst Momentum", momentum["state"], f"score {momentum['score']:+.1f}", signal_color("BULL" if momentum["score"]>0 else "BEAR" if momentum["score"]<0 else ""))
@@ -1210,7 +1412,7 @@ elif area == "Research":
         )
 
         if not events:
-            st.info("No analyst events are stored for this ticker yet. Configure MKTSCAN_BENZINGA_KEY on the scheduler service and wait for the next 15-minute market-hours refresh.")
+            st.info("No analyst events are stored for this ticker yet. Use **Refresh analyst data** above. Benzinga requires the Analyst Ratings entitlement; Yahoo is attempted as a fallback.")
         else:
             rows=[]
             for e in events:

@@ -193,13 +193,16 @@ class MarketWatchScraper:
     def fetch_economic_calendar(self) -> list[dict]:
         """
         Scrape the MarketWatch economic calendar.
-        Returns a list of upcoming economic events with date, time, name,
-        period, consensus estimate, and prior reading.
+        Returns upcoming U.S. economic events with ET times normalized to UTC.
         """
         events = []
         try:
             soup = self._get(MW_ECON_CAL_URL)
             events = self._parse_calendar(soup)
+            # MarketWatch occasionally changes wrappers while leaving the table
+            # text intact. A second text-oriented parser recovers those rows.
+            if not events:
+                events = self._parse_calendar_text(soup)
             log.info(f"[MarketWatch] Economic calendar: {len(events)} events found")
         except Exception as e:
             log.error(f"[MarketWatch] Economic calendar failed: {e}")
@@ -309,6 +312,61 @@ class MarketWatchScraper:
             except Exception as e:
                 log.debug(f"[MarketWatch] Calendar row parse error: {e}")
 
+        return events
+
+    def _parse_calendar_text(self, soup: BeautifulSoup) -> list[dict]:
+        """Recover the current MarketWatch calendar from flattened page text.
+
+        Handles rows such as:
+        Monday, Aug. 17
+        8:30 AM | Empire State Manufacturing Survey | Aug. | 20.6 | 12 | 15.6
+        """
+        events = []
+        current_date = None
+
+        # Prefer table rows even if MarketWatch changed the table classes.
+        for row in soup.find_all("tr"):
+            cells = [c.get_text(" ", strip=True) for c in row.find_all(["td", "th"])]
+            raw = " ".join(cells).strip()
+            if not raw:
+                continue
+
+            maybe_date = self._parse_date_header(raw)
+            if maybe_date and (
+                len(cells) <= 2
+                or re.match(r"^(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),", raw, re.I)
+            ):
+                current_date = maybe_date
+                continue
+
+            if current_date is None or len(cells) < 2:
+                continue
+            # Skip "Add to My Calendar" helper rows.
+            if raw.lower().startswith("add to my calendar"):
+                continue
+
+            time_str = cells[0]
+            if not re.match(r"^\d{1,2}:\d{2}\s*(AM|PM)$", time_str, re.I):
+                continue
+            event_name = cells[1]
+            period = cells[2] if len(cells) > 2 else ""
+            actual = cells[3] if len(cells) > 3 else ""
+            consensus = cells[4] if len(cells) > 4 else ""
+            prior = cells[5] if len(cells) > 5 else ""
+            event_dt = self._combine_datetime(current_date, time_str)
+            events.append({
+                "date": current_date,
+                "datetime": event_dt,
+                "time_str": time_str,
+                "name": event_name,
+                "period": period,
+                "consensus": consensus,
+                "prior": prior,
+                "actual": actual,
+                "category": self._categorise(event_name),
+                "importance": self._importance(event_name),
+                "source": "marketwatch",
+            })
         return events
 
     def _parse_calendar_fallback(self, soup: BeautifulSoup) -> list[dict]:

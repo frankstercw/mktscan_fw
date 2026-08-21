@@ -124,11 +124,13 @@ class ScrapeEngine:
         # does not alter tradeability scores.
         if self.mw and mode in ("all", "prices"):
             try:
-                self._log("info", "Macro calendar: refreshing high-impact events...")
-                from .macro import upsert_macro_events
-                macro_events = self.mw.fetch_economic_calendar()
-                saved = upsert_macro_events(session, macro_events)
-                self._log("ok", f"Macro calendar: {len(macro_events)} events ({saved} new)")
+                self._log("info", "Macro calendar: refreshing economic events...")
+                from .macro import refresh_economic_calendar
+                macro_result = refresh_economic_calendar(session)
+                total = macro_result.get("marketwatch_events", 0) + macro_result.get("benzinga_events", 0)
+                saved = macro_result.get("marketwatch_new", 0) + macro_result.get("benzinga_new", 0)
+                source = macro_result.get("source") or "none"
+                self._log("ok", f"Macro calendar: {total} events ({saved} new) via {source}")
             except Exception as e:
                 session.rollback()
                 log.warning(f"[Regime] Macro calendar refresh failed: {e}")
