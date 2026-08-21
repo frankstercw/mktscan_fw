@@ -44,7 +44,7 @@ from mktscan.database import (
 from mktscan.options import DISCLAIMER, generate_basket_setups
 from mktscan.on_demand import normalize_ticker, run_on_demand_review
 from mktscan.options_interpretation import interpret_options_market
-from mktscan.terminal import iv_state, semantic_signal, setup_quality
+from mktscan.terminal import detect_divergences, directional_conviction, iv_state, semantic_signal, setup_quality, signal_agreement
 from mktscan.trade_journal import close_trade, create_trade, mark_trade, trade_metrics
 
 st.set_page_config(page_title="MktScan", page_icon="◈", layout="wide", initial_sidebar_state="expanded")
@@ -624,6 +624,9 @@ METRIC_HELP: dict[str, dict[str, str]] = {
     "Positions": {"source": "MktScan Trade Journal", "definition": "Count of currently open journal positions.", "interpret": "Use with capital at risk and concentration; position count can understate risk when trades are highly correlated."},
     "Net Bias": {"source": "MktScan Trade Journal", "definition": "Simple directional balance of open bullish versus bearish journal positions.", "interpret": "Shows portfolio directional tilt; it is not delta-weighted until live contract Greeks are integrated."},
     "Analyst Momentum": {"source": "Benzinga Analyst Ratings API via MktScan", "definition": "30-day weighted score of upgrades/downgrades, bullish/bearish initiations and price-target changes.", "interpret": "Positive means recent sell-side actions skew constructive; negative means deteriorating analyst sentiment. Treat as a catalyst/confirmation layer, not a standalone trading signal."},
+    "Directional Conviction": {"source": "MktScan Direction Engine v2", "definition": "0–100 confidence score built from independent signal families: MktScan model, macro, trend, momentum, participation, catalysts and options context.", "interpret": "Higher means more independent evidence supports the resolved direction. It is a confidence/ranking measure, not a probability that the option trade will win."},
+    "Signal Agreement": {"source": "MktScan Direction Engine v2", "definition": "Share of non-neutral signal families that agree with the resolved directional thesis.", "interpret": "HIGH means broad confirmation across independent families; LOW means the headline direction hides important disagreement and deserves more caution."},
+    "Divergences": {"source": "MktScan divergence engine", "definition": "Explicit contradictions between the directional thesis and momentum, relative strength, volume, analyst activity, volatility or options-market context.", "interpret": "High-severity divergences are reasons to reduce conviction, wait for confirmation, or reject the trade even when the primary signal is strong."},
     "Analyst Events": {"source": "Benzinga Analyst Ratings API", "definition": "Number of analyst rating/price-target events stored for the selected 30-day window.", "interpret": "Higher event count means more sell-side activity; interpret the direction and quality of actions rather than treating activity itself as bullish or bearish."},
     "Upgrades": {"source": "Benzinga Analyst Ratings API", "definition": "Count of analyst upgrades during the trailing 30 days.", "interpret": "A cluster of upgrades can confirm improving sentiment, especially when price/volume momentum agrees."},
     "Downgrades": {"source": "Benzinga Analyst Ratings API", "definition": "Count of analyst downgrades during the trailing 30 days.", "interpret": "Multiple downgrades can flag deteriorating expectations; compare with price reaction and whether downgrades are already discounted."},
@@ -645,32 +648,141 @@ METRIC_HELP: dict[str, dict[str, str]] = {
     "Breakeven": {"source": "MktScan options payoff model", "definition": "Underlying price at expiration where the proposed option position has approximately zero P&L.", "interpret": "Compare breakeven with spot, expected move and your price target to judge whether the thesis has enough room."},
 }
 
-def metric_help(label: str, source: str | None = None, definition: str | None = None, interpret: str | None = None) -> str:
+def tooltip_text(source: str, definition: str, interpretation: str) -> str:
+    """Canonical three-section tooltip layout used across the dashboard."""
+    return (
+        f"SOURCE\n"
+        f"{source}\n\n"
+        f"DEFINITION\n"
+        f"{definition}\n\n"
+        f"HOW TO INTERPRET\n"
+        f"{interpretation}"
+    )
+
+
+def normalize_tooltip(value: str | None) -> str:
+    """Upgrade legacy tooltip copy to the v3.1 three-section format."""
+    raw = str(value or "").strip()
+
+    # Older dashboard strings sometimes contain escaped linebreaks rather than
+    # literal newlines. Normalize both forms before parsing.
+    raw = raw.replace("\\\\n", "\n").replace("\\n", "\n")
+
+    if not raw:
+        return tooltip_text(
+            "MktScan",
+            "Dashboard metric used by the MktScan decision workflow.",
+            "Interpret it together with nearby signals, regime, event risk, and data freshness.",
+        )
+
+    if raw.startswith("SOURCE\n") and "\n\nDEFINITION\n" in raw and "\n\nHOW TO INTERPRET\n" in raw:
+        return raw
+
+    # Legacy "Source: ... Definition: ... How to interpret: ..." format.
+    match = re.match(
+        r"(?is)^\s*Source:\s*(.*?)\s*Definition:\s*(.*?)\s*How to interpret:\s*(.*?)\s*$",
+        raw,
+    )
+    if match:
+        return tooltip_text(
+            match.group(1).strip(),
+            match.group(2).strip(),
+            match.group(3).strip(),
+        )
+
+    # Slightly more tolerant parser for multiline variants.
+    source_match = re.search(
+        r"(?is)\bSource:\s*(.*?)(?=\n{2,}Definition:|\s+Definition:|$)",
+        raw,
+    )
+    definition_match = re.search(
+        r"(?is)\bDefinition:\s*(.*?)(?=\n{2,}How to interpret:|\s+How to interpret:|$)",
+        raw,
+    )
+    interpretation_match = re.search(
+        r"(?is)\bHow to interpret:\s*(.*)$",
+        raw,
+    )
+    if source_match and definition_match and interpretation_match:
+        return tooltip_text(
+            source_match.group(1).strip(),
+            definition_match.group(1).strip(),
+            interpretation_match.group(1).strip(),
+        )
+
+    # Explanatory help text that never had the three labels still gets wrapped
+    # consistently instead of rendering as an unstructured paragraph.
+    return tooltip_text(
+        "MktScan",
+        raw,
+        "Use this information together with the surrounding market state, setup quality, event risk, and data freshness.",
+    )
+
+
+def metric_help(
+    label: str,
+    source: str | None = None,
+    definition: str | None = None,
+    interpret: str | None = None,
+) -> str:
     d = METRIC_HELP.get(label, {})
     src = source or d.get("source", "MktScan")
-    defin = definition or d.get("definition", f"{label} metric used by the MktScan decision workflow.")
-    interp = interpret or d.get("interpret", "Interpret in context with the surrounding signal, regime, event risk and data freshness.")
-    return f"Source: {src}\\n\\nDefinition: {defin}\\n\\nHow to interpret: {interp}"
+    defin = definition or d.get(
+        "definition",
+        f"{label} metric used by the MktScan decision workflow.",
+    )
+    interp = interpret or d.get(
+        "interpret",
+        "Interpret in context with the surrounding signal, regime, event risk and data freshness.",
+    )
+    return tooltip_text(src, defin, interp)
+
 
 def ui_metric(container, label: str, value, delta=None, **kwargs):
     kwargs.setdefault("help", metric_help(label))
     return container.metric(label, value, delta=delta, **kwargs)
 
-def card(label: str, value: str, sub: str = "", cls: str = "", help_text: str | None = None):
-    tip = (help_text or metric_help(label)).replace('"', '&quot;').replace("\\n", " • ")
+
+def card(
+    label: str,
+    value: str,
+    sub: str = "",
+    cls: str = "",
+    help_text: str | None = None,
+):
+    # Keep the browser-hover tooltip readable instead of collapsing sections
+    # into one bullet-delimited line.
+    tip = normalize_tooltip(help_text or metric_help(label))
+    tip = (
+        tip.replace("&", "&amp;")
+        .replace('"', "&quot;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace("\n", "&#10;")
+    )
     st.markdown(
-        f'<div class="tv-card" title="{tip}"><div class="tv-kicker">{label} ⓘ</div>'
-        f'<div class="tv-value {cls}">{value}</div><div class="tv-small">{sub}</div></div>',
+        f'<div class="tv-card" title="{tip}">'
+        f'<div class="tv-kicker">{label} ⓘ</div>'
+        f'<div class="tv-value {cls}">{value}</div>'
+        f'<div class="tv-small">{sub}</div></div>',
         unsafe_allow_html=True,
     )
 
-def dataframe_with_help(df: pd.DataFrame, help_overrides: dict[str, str] | None = None, **kwargs):
+
+def dataframe_with_help(
+    df: pd.DataFrame,
+    help_overrides: dict[str, str] | None = None,
+    **kwargs,
+):
     overrides = help_overrides or {}
     cfg = {}
     for col in df.columns:
-        cfg[col] = st.column_config.Column(col, help=overrides.get(col, metric_help(str(col))))
+        raw_help = overrides.get(col, metric_help(str(col)))
+        cfg[col] = st.column_config.Column(
+            col,
+            help=normalize_tooltip(raw_help),
+        )
     return st.dataframe(df, column_config=cfg, **kwargs)
-
 
 def nav_to(area: str, ticker: str | None = None, section: str | None = None):
     """Safe Streamlit navigation callback. Called via on_click before rerun."""
@@ -1150,9 +1262,10 @@ elif area == "Key Events":
         econ_major_only = st.toggle(
             "Major economic events only",
             value=False,
-            help=(
-                "Off reproduces the fuller legacy economic calendar. "
-                "Turn on to keep only High/Medium importance macro releases."
+            help=tooltip_text(
+                "MktScan Key Events calendar",
+                "Controls whether the economic calendar shows the full stored event set or only High/Medium importance macro releases.",
+                "Leave this off for the fuller legacy calendar. Turn it on when you want a cleaner event-risk view focused on releases most likely to move rates, indexes, and implied volatility.",
             ),
         )
         if econ_major_only:
@@ -1456,6 +1569,61 @@ elif area == "Research":
             card("Signal", semantic_signal(decision["score"]), f"raw {decision['score']:+.2f}" if decision["score"] is not None else "", signal_color(semantic_signal(decision["score"])))
             card("IV", iv_state(float(opt.iv_percentile_1y) if opt and opt.iv_percentile_1y is not None else None), f"{opt.iv_percentile_1y:.0f}th percentile" if opt and opt.iv_percentile_1y is not None else "history unavailable")
 
+        analyst_events, analyst_mom = analyst_activity(ticker, 60)
+        options_bias = decision["options"].structure_bias if decision["options"] else None
+        direction_engine = directional_conviction(
+            decision["score"],
+            getattr(sig, "coverage", None) if sig else None,
+            regime.regime_label if regime else None,
+            tech,
+            analyst_state=analyst_mom.get("state"),
+            options_bias=options_bias,
+        )
+        agreement = signal_agreement(direction_engine)
+        divergences = detect_divergences(
+            direction_engine,
+            tech,
+            analyst_state=analyst_mom.get("state"),
+            iv_percentile=float(opt.iv_percentile_1y) if opt and opt.iv_percentile_1y is not None else None,
+            put_skew=float(opt.put_skew) if opt and opt.put_skew is not None else None,
+        )
+
+        st.markdown('<div class="tv-section">Direction Engine v2</div>', unsafe_allow_html=True)
+        d1,d2,d3=st.columns(3)
+        with d1:
+            card("Directional Conviction", f"{direction_engine['conviction']}/100", direction_engine["direction"], signal_color(direction_engine["direction"]))
+        with d2:
+            card("Signal Agreement", agreement["label"], f"{agreement['agreeing']}/{agreement['directional']} directional families agree", "tv-bull" if agreement["label"]=="HIGH" else "tv-warn" if agreement["label"]=="MODERATE" else "tv-bear")
+        with d3:
+            high_div = sum(d["severity"]=="HIGH" for d in divergences)
+            card("Divergences", str(len(divergences)), f"{high_div} high severity", "tv-bear" if high_div else "tv-warn" if divergences else "tv-bull")
+
+        family_rows=[]
+        for name, family in direction_engine["families"].items():
+            vote = "BULLISH" if family["vote"] > 0 else "BEARISH" if family["vote"] < 0 else "NEUTRAL"
+            family_rows.append({"Signal Family": name, "State": family["state"], "Vote": vote, "Weight": f"{family['weight']:.0%}"})
+        dataframe_with_help(
+            pd.DataFrame(family_rows),
+            help_overrides={
+                "Signal Family": "Source: MktScan Direction Engine v2. Definition: Independent evidence family. How to interpret: Families are grouped so correlated indicators do not receive multiple independent votes.",
+                "State": "Source: Underlying MktScan family input. Definition: Current semantic state of that family. How to interpret: Compare states across families rather than focusing on one indicator.",
+                "Vote": "Source: MktScan Direction Engine v2. Definition: Normalized bullish, bearish or neutral family vote. How to interpret: Broad agreement strengthens conviction; opposing votes create divergences.",
+                "Weight": "Source: Transparent Direction Engine v2 rule set. Definition: Relative family contribution. How to interpret: These initial weights should be validated before any optimization.",
+            },
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        if divergences:
+            st.markdown("#### Divergence warnings")
+            for div in divergences:
+                if div["severity"] == "HIGH":
+                    st.error(f"**{div['title']}** — {div['detail']}")
+                else:
+                    st.warning(f"**{div['title']}** — {div['detail']}")
+        else:
+            st.success("No material cross-signal divergences detected.")
+
         st.markdown('<div class="tv-section">Setup scorecard</div>', unsafe_allow_html=True)
         c1,c2,c3,c4=st.columns(4)
         with c1: card("Trend",tech.trend_state,f"ADX {tech.adx14:.0f}" if tech.adx14 is not None else "ADX —",signal_color(tech.trend_state))
@@ -1465,7 +1633,6 @@ elif area == "Research":
         st.caption("Strengths: " + (" · ".join(q["strengths"]) or "None confirmed"))
         if decision["risks"]: st.warning("Risks: " + " · ".join(decision["risks"]))
 
-        analyst_events, analyst_mom = analyst_activity(ticker, 60)
         st.markdown('<div class="tv-section">Analyst Activity</div>', unsafe_allow_html=True)
         a1,a2,a3,a4,a5=st.columns(5)
         with a1: card("Analyst Momentum", analyst_mom["state"], f"score {analyst_mom['score']:+.1f}", signal_color("BULL" if analyst_mom["score"]>0 else "BEAR" if analyst_mom["score"]<0 else ""))

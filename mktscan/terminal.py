@@ -116,3 +116,191 @@ def setup_quality(score, coverage, regime_label, tech: TechnicalOpportunity|None
     points=min(100,max(0,50 + 35*abs(score or 0) + 10*((coverage or .5)-.5) + 4*len(strengths)-5*len(risks)))
     label='HIGH' if points>=75 else 'MODERATE' if points>=55 else 'LOW'
     return {'score':round(points), 'label':label, 'strengths':strengths[:4], 'risks':risks[:4]}
+
+
+def _direction_vote(value: str | None) -> int:
+    """Normalize semantic states into -1 / 0 / +1 directional votes."""
+    s = str(value or "").upper()
+    bullish = ("BULL", "POSITIVE", "STRONG", "CONFIRMED", "RISK_ON", "HEALTHY")
+    bearish = ("BEAR", "NEGATIVE", "LAGGING", "WEAK", "RISK_OFF", "STRESS")
+    if any(x in s for x in bullish) and not any(x in s for x in bearish):
+        return 1
+    if any(x in s for x in bearish) and not any(x in s for x in bullish):
+        return -1
+    return 0
+
+
+def directional_conviction(
+    score: float | None,
+    coverage: float | None,
+    regime_label: str | None,
+    tech: TechnicalOpportunity | None,
+    *,
+    analyst_state: str | None = None,
+    options_bias: str | None = None,
+) -> dict[str, Any]:
+    """Direction Engine v2.
+
+    Signal families are deliberately grouped so correlated technical indicators
+    do not each receive an independent vote.
+    """
+    direction = semantic_signal(score)
+    base_vote = 1 if "BULL" in direction else -1 if "BEAR" in direction else 0
+
+    families: dict[str, dict[str, Any]] = {}
+
+    # Core model / underlying directional family.
+    model_strength = min(1.0, abs(float(score or 0.0)) / 0.65)
+    families["MktScan"] = {
+        "vote": base_vote,
+        "state": direction,
+        "weight": 0.30,
+        "strength": model_strength,
+    }
+
+    # Macro family only votes when broad regime aligns directionally.
+    macro_vote = 1 if regime_label and "RISK_ON" in regime_label else -1 if regime_label and "RISK_OFF" in regime_label else 0
+    families["Macro"] = {
+        "vote": macro_vote,
+        "state": regime_label or "UNKNOWN",
+        "weight": 0.20,
+        "strength": 0.8 if macro_vote else 0.35,
+    }
+
+    if tech:
+        trend_vote = 1 if "BULL" in tech.trend_state else -1 if "BEAR" in tech.trend_state else 0
+        momentum_vote = 1 if ("BULL" in tech.momentum_state or tech.momentum_state == "POSITIVE") else -1 if ("BEAR" in tech.momentum_state or tech.momentum_state == "NEGATIVE") else 0
+        participation_vote = 0
+        if tech.relative_strength_state in {"STRONG", "POSITIVE"}:
+            participation_vote += 1
+        elif tech.relative_strength_state in {"WEAK", "LAGGING"}:
+            participation_vote -= 1
+        if tech.volume_state == "CONFIRMED":
+            participation_vote += 1 if base_vote >= 0 else -1
+        participation_vote = 1 if participation_vote > 0 else -1 if participation_vote < 0 else 0
+
+        families["Trend"] = {
+            "vote": trend_vote,
+            "state": tech.trend_state,
+            "weight": 0.18,
+            "strength": 1.0 if "STRONG" in tech.trend_state else 0.7 if trend_vote else 0.35,
+        }
+        families["Momentum"] = {
+            "vote": momentum_vote,
+            "state": tech.momentum_state,
+            "weight": 0.14,
+            "strength": 1.0 if "ACCELERATING" in tech.momentum_state else 0.7 if momentum_vote else 0.35,
+        }
+        families["Participation"] = {
+            "vote": participation_vote,
+            "state": f"{tech.relative_strength_state} / {tech.volume_state}",
+            "weight": 0.10,
+            "strength": 0.9 if tech.volume_state == "CONFIRMED" else 0.65,
+        }
+
+    analyst_vote = 1 if analyst_state and "POSITIVE" in analyst_state else -1 if analyst_state and "NEGATIVE" in analyst_state else 0
+    families["Catalyst"] = {
+        "vote": analyst_vote,
+        "state": analyst_state or "NEUTRAL",
+        "weight": 0.05,
+        "strength": 0.75 if analyst_vote else 0.3,
+    }
+
+    option_vote = _direction_vote(options_bias)
+    families["Options"] = {
+        "vote": option_vote,
+        "state": options_bias or "NEUTRAL",
+        "weight": 0.03,
+        "strength": 0.5 if option_vote else 0.25,
+    }
+
+    # Renormalize weights for available families.
+    total_weight = sum(v["weight"] for v in families.values())
+    weighted = sum(v["vote"] * v["strength"] * v["weight"] for v in families.values()) / total_weight if total_weight else 0.0
+
+    # Coverage affects confidence, not direction.
+    coverage_factor = 0.65 + 0.35 * max(0.0, min(1.0, float(coverage if coverage is not None else 0.5)))
+    conviction = round(min(100.0, abs(weighted) * 100.0 * coverage_factor))
+
+    resolved_direction = "BULLISH" if weighted >= 0.12 else "BEARISH" if weighted <= -0.12 else "NEUTRAL"
+    if conviction >= 80 and resolved_direction != "NEUTRAL":
+        resolved_direction = f"STRONG {resolved_direction.replace('ISH','')}" if resolved_direction == "BULLISH" else "STRONG BEAR"
+
+    return {
+        "direction": resolved_direction,
+        "conviction": conviction,
+        "weighted_score": round(weighted, 3),
+        "families": families,
+    }
+
+
+def signal_agreement(conviction_result: dict[str, Any]) -> dict[str, Any]:
+    """Summarize independent family agreement with the resolved direction."""
+    families = conviction_result.get("families", {})
+    direction = conviction_result.get("direction", "NEUTRAL")
+    target = 1 if "BULL" in direction else -1 if "BEAR" in direction else 0
+    directional = [v for v in families.values() if v.get("vote") != 0]
+    agreeing = [v for v in directional if v.get("vote") == target] if target else []
+    opposing = [v for v in directional if target and v.get("vote") == -target]
+    ratio = len(agreeing) / len(directional) if directional else 0.0
+    label = "HIGH" if ratio >= 0.75 and len(directional) >= 4 else "MODERATE" if ratio >= 0.55 else "LOW"
+    return {
+        "label": label,
+        "agreeing": len(agreeing),
+        "directional": len(directional),
+        "opposing": len(opposing),
+        "ratio": ratio,
+    }
+
+
+def detect_divergences(
+    conviction_result: dict[str, Any],
+    tech: TechnicalOpportunity | None,
+    *,
+    analyst_state: str | None = None,
+    iv_percentile: float | None = None,
+    put_skew: float | None = None,
+) -> list[dict[str, str]]:
+    """Explicit contradictions worth surfacing before a directional option trade."""
+    out: list[dict[str, str]] = []
+    direction = conviction_result.get("direction", "NEUTRAL")
+    bullish = "BULL" in direction
+    bearish = "BEAR" in direction
+
+    if tech:
+        if bullish and tech.relative_strength_state in {"LAGGING", "WEAK"}:
+            out.append({"severity": "HIGH", "title": "Relative-strength divergence", "detail": "Bullish directional thesis, but the ticker is lagging SPY/QQQ."})
+        if bearish and tech.relative_strength_state in {"STRONG", "POSITIVE"}:
+            out.append({"severity": "HIGH", "title": "Relative-strength divergence", "detail": "Bearish directional thesis, but the ticker is outperforming its benchmarks."})
+        if bullish and tech.momentum_state in {"NEGATIVE", "ACCELERATING BEARISH"}:
+            out.append({"severity": "HIGH", "title": "Momentum divergence", "detail": "Bullish thesis conflicts with deteriorating price momentum."})
+        if bearish and tech.momentum_state in {"POSITIVE", "ACCELERATING BULLISH"}:
+            out.append({"severity": "HIGH", "title": "Momentum divergence", "detail": "Bearish thesis conflicts with improving price momentum."})
+        if tech.volume_state == "WEAK" and ("STRONG" in direction or tech.trend_state.startswith("STRONG")):
+            out.append({"severity": "MEDIUM", "title": "Participation divergence", "detail": "Strong directional move lacks volume confirmation."})
+        if bullish and tech.rsi14 is not None and tech.rsi14 >= 75:
+            out.append({"severity": "MEDIUM", "title": "Extension risk", "detail": f"RSI {tech.rsi14:.0f} is extended despite the bullish thesis."})
+        if bearish and tech.rsi14 is not None and tech.rsi14 <= 25:
+            out.append({"severity": "MEDIUM", "title": "Oversold risk", "detail": f"RSI {tech.rsi14:.0f} is deeply oversold despite the bearish thesis."})
+
+    if bullish and analyst_state and "NEGATIVE" in analyst_state:
+        out.append({"severity": "MEDIUM", "title": "Analyst divergence", "detail": f"MktScan is bullish while 30D analyst momentum is {analyst_state.lower()}."})
+    if bearish and analyst_state and "POSITIVE" in analyst_state:
+        out.append({"severity": "MEDIUM", "title": "Analyst divergence", "detail": f"MktScan is bearish while 30D analyst momentum is {analyst_state.lower()}."})
+
+    if iv_percentile is not None and iv_percentile >= 85:
+        out.append({"severity": "MEDIUM", "title": "Volatility pricing risk", "detail": f"IV is in the {iv_percentile:.0f}th percentile; long premium is historically expensive."})
+    if bullish and put_skew is not None and put_skew >= 8:
+        out.append({"severity": "MEDIUM", "title": "Options downside hedge demand", "detail": f"Put skew is elevated ({put_skew:+.1f}), indicating relatively expensive downside protection."})
+
+    # Family-level contradictions.
+    target = 1 if bullish else -1 if bearish else 0
+    if target:
+        opposing = [
+            name for name, family in conviction_result.get("families", {}).items()
+            if family.get("vote") == -target
+        ]
+        if len(opposing) >= 2:
+            out.append({"severity": "HIGH", "title": "Cross-signal disagreement", "detail": "Opposing signal families: " + ", ".join(opposing) + "."})
+
+    return out[:6]
