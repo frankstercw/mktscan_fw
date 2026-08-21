@@ -415,6 +415,37 @@ class OptionsMarketSnapshot(Base):
     )
 
 
+class AnalystRatingEvent(Base):
+    """Benzinga analyst rating / price-target event."""
+    __tablename__ = "analyst_rating_events"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    external_id = Column(String(100), nullable=False, unique=True)
+    ticker = Column(String(15), nullable=False)
+    published_at = Column(DateTime, nullable=False)
+
+    firm = Column(String(200))
+    analyst_name = Column(String(200))
+    action_company = Column(String(50))
+    action_pt = Column(String(50))
+    rating_prior = Column(String(100))
+    rating_current = Column(String(100))
+    pt_prior = Column(Float)
+    pt_current = Column(Float)
+    importance = Column(Integer)
+    url = Column(Text)
+    source = Column(String(30), nullable=False, default="benzinga")
+    raw_json = Column(Text)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        Index("ix_analyst_rating_ticker_published", "ticker", "published_at"),
+        Index("ix_analyst_rating_published", "published_at"),
+    )
+
+
 class TradeJournalEntry(Base):
     """Manual trade journal with immutable MktScan context captured at entry."""
     __tablename__ = "trade_journal_entries"
@@ -478,6 +509,16 @@ class TradeJournalEntry(Base):
     put_skew = Column(Float)
     call_skew = Column(Float)
     expected_move_pct = Column(Float)
+
+    # Analyst-rating state frozen at entry (30-day lookback).
+    analyst_snapshot_at = Column(DateTime)
+    analyst_momentum_score = Column(Float)
+    analyst_momentum_state = Column(String(30))
+    analyst_events_30d = Column(Integer)
+    analyst_upgrades_30d = Column(Integer)
+    analyst_downgrades_30d = Column(Integer)
+    analyst_pt_raises_30d = Column(Integer)
+    analyst_pt_cuts_30d = Column(Integer)
 
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

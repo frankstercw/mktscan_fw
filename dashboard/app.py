@@ -23,7 +23,9 @@ from sqlalchemy import desc, func, select
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from mktscan.config import load_config
+from mktscan.analyst_ratings import get_analyst_momentum
 from mktscan.database import (
+    AnalystRatingEvent,
     Article,
     Company,
     EarningsEvent,
@@ -169,6 +171,60 @@ def latest_options_rows() -> dict[str, OptionsMarketSnapshot]:
         return out
     finally:
         s.close()
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def analyst_activity(ticker: str, days: int = 60) -> tuple[list[dict], dict]:
+    s = get_session()
+    try:
+        start = datetime.utcnow() - timedelta(days=days)
+        rows = s.execute(
+            select(AnalystRatingEvent)
+            .where(
+                AnalystRatingEvent.ticker == ticker.upper(),
+                AnalystRatingEvent.published_at >= start,
+            )
+            .order_by(desc(AnalystRatingEvent.published_at))
+        ).scalars().all()
+        momentum = get_analyst_momentum(s, ticker, days=30)
+        events = [{
+            "published_at": r.published_at,
+            "firm": r.firm,
+            "analyst_name": r.analyst_name,
+            "action_company": r.action_company,
+            "action_pt": r.action_pt,
+            "rating_prior": r.rating_prior,
+            "rating_current": r.rating_current,
+            "pt_prior": r.pt_prior,
+            "pt_current": r.pt_current,
+            "importance": r.importance,
+            "url": r.url,
+        } for r in rows]
+        return events, momentum
+    finally:
+        s.close()
+
+
+def _analyst_event_text(e: AnalystRatingEvent) -> str:
+    firm = e.firm or "Analyst"
+    company_action = (e.action_company or "").strip()
+    pt_action = (e.action_pt or "").strip()
+    parts = [firm]
+    if company_action:
+        parts.append(company_action)
+    if e.rating_prior or e.rating_current:
+        if e.rating_prior and e.rating_current and e.rating_prior != e.rating_current:
+            parts.append(f"{e.rating_prior} → {e.rating_current}")
+        elif e.rating_current:
+            parts.append(str(e.rating_current))
+    if pt_action:
+        if e.pt_prior is not None and e.pt_current is not None:
+            parts.append(f"{pt_action} PT ${e.pt_prior:.0f} → ${e.pt_current:.0f}")
+        elif e.pt_current is not None:
+            parts.append(f"{pt_action} PT ${e.pt_current:.0f}")
+        else:
+            parts.append(pt_action)
+    return " · ".join(parts)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -482,6 +538,33 @@ def change_feed(limit: int = 12) -> list[dict]:
         regs = s.execute(select(MarketRegimeSnapshot).order_by(desc(MarketRegimeSnapshot.snapped_at)).limit(2)).scalars().all()
         if len(regs) == 2 and regs[0].regime_label != regs[1].regime_label:
             events.append({"at": regs[0].snapped_at, "ticker": "MARKET", "text": f"Regime {regs[1].regime_label} → {regs[0].regime_label}", "kind": "market"})
+
+        analyst_cutoff = datetime.utcnow() - timedelta(days=2)
+        watched_analyst = set(tickers)
+        watched_analyst.update(
+            s.execute(
+                select(TradeJournalEntry.ticker).where(TradeJournalEntry.status == "OPEN")
+            ).scalars().all()
+        )
+        analyst_rows = s.execute(
+            select(AnalystRatingEvent)
+            .where(
+                AnalystRatingEvent.published_at >= analyst_cutoff,
+                AnalystRatingEvent.ticker.in_(sorted(watched_analyst)),
+            )
+            .order_by(desc(AnalystRatingEvent.published_at))
+            .limit(20)
+        ).scalars().all()
+        for a in analyst_rows:
+            action = f"{a.action_company or ''} {a.action_pt or ''}".upper()
+            if not any(k in action for k in ("UPGRADE", "DOWNGRADE", "INITIAT", "REINST", "RAISE", "LOWER", "CUT", "INCREASE", "DECREASE")):
+                continue
+            events.append({
+                "at": a.published_at,
+                "ticker": a.ticker,
+                "text": _analyst_event_text(a),
+                "kind": "analyst",
+            })
     finally:
         s.close()
     events.sort(key=lambda x: x["at"] or datetime.min, reverse=True)
@@ -540,6 +623,12 @@ METRIC_HELP: dict[str, dict[str, str]] = {
     "Directional accuracy": {"source": "MktScan TradeabilityOutcome", "definition": "Share of resolved signals whose score direction matched the sign of the subsequent return.", "interpret": ">50% can be useful depending on payoff asymmetry, but accuracy alone does not establish profitability."},
     "Positions": {"source": "MktScan Trade Journal", "definition": "Count of currently open journal positions.", "interpret": "Use with capital at risk and concentration; position count can understate risk when trades are highly correlated."},
     "Net Bias": {"source": "MktScan Trade Journal", "definition": "Simple directional balance of open bullish versus bearish journal positions.", "interpret": "Shows portfolio directional tilt; it is not delta-weighted until live contract Greeks are integrated."},
+    "Analyst Momentum": {"source": "Benzinga Analyst Ratings API via MktScan", "definition": "30-day weighted score of upgrades/downgrades, bullish/bearish initiations and price-target changes.", "interpret": "Positive means recent sell-side actions skew constructive; negative means deteriorating analyst sentiment. Treat as a catalyst/confirmation layer, not a standalone trading signal."},
+    "Analyst Events": {"source": "Benzinga Analyst Ratings API", "definition": "Number of analyst rating/price-target events stored for the selected 30-day window.", "interpret": "Higher event count means more sell-side activity; interpret the direction and quality of actions rather than treating activity itself as bullish or bearish."},
+    "Upgrades": {"source": "Benzinga Analyst Ratings API", "definition": "Count of analyst upgrades during the trailing 30 days.", "interpret": "A cluster of upgrades can confirm improving sentiment, especially when price/volume momentum agrees."},
+    "Downgrades": {"source": "Benzinga Analyst Ratings API", "definition": "Count of analyst downgrades during the trailing 30 days.", "interpret": "Multiple downgrades can flag deteriorating expectations; compare with price reaction and whether downgrades are already discounted."},
+    "PT Raises": {"source": "Benzinga Analyst Ratings API", "definition": "Count of analyst price-target increases during the trailing 30 days.", "interpret": "Repeated target raises suggest improving earnings/valuation expectations, but target changes are weaker evidence than rating changes."},
+    "PT Cuts": {"source": "Benzinga Analyst Ratings API", "definition": "Count of analyst price-target reductions during the trailing 30 days.", "interpret": "Repeated target cuts can be a caution signal, particularly if momentum and estimates are also weakening."},
     "Setup Quality": {"source": "MktScan terminal.setup_quality", "definition": "Workflow heuristic combining tradeability, regime, technical state, IV and event proximity.", "interpret": "Use HIGH/MODERATE/LOW to prioritize review. It is intentionally not presented as a calibrated probability."},
     "Trend": {"source": "MktScan technical_opportunity from underlying OHLCV", "definition": "Trend state derived from moving averages and ADX/trend-strength context.", "interpret": "Strong bullish/bearish trend alignment supports directional trades; weak trend argues for lower conviction."},
     "Momentum": {"source": "MktScan technical_opportunity from underlying OHLCV", "definition": "Momentum state derived from recent returns, acceleration and RSI context.", "interpret": "Accelerating momentum supports continuation setups; decelerating momentum can warn that a move is losing force."},
@@ -995,7 +1084,7 @@ elif area == "Research":
 
     if "research_section" not in st.session_state:
         st.session_state["research_section"]="Summary"
-    section=st.radio("Research view", ["Summary","Chart","Options","Trade Builder","ChatGPT Research","Advanced"], key="research_section", horizontal=True, label_visibility="collapsed")
+    section=st.radio("Research view", ["Summary","Chart","Options","Analyst Activity","Trade Builder","ChatGPT Research","Advanced"], key="research_section", horizontal=True, label_visibility="collapsed")
 
     if section=="Summary":
         with st.spinner("Calculating technical opportunity…"):
@@ -1031,6 +1120,24 @@ elif area == "Research":
         with c4: card("Volume",tech.volume_state,f"RVOL {tech.rvol20:.2f}×" if tech.rvol20 is not None else "RVOL —")
         st.caption("Strengths: " + (" · ".join(q["strengths"]) or "None confirmed"))
         if decision["risks"]: st.warning("Risks: " + " · ".join(decision["risks"]))
+
+        analyst_events, analyst_mom = analyst_activity(ticker, 60)
+        st.markdown('<div class="tv-section">Analyst Activity</div>', unsafe_allow_html=True)
+        a1,a2,a3,a4,a5=st.columns(5)
+        with a1: card("Analyst Momentum", analyst_mom["state"], f"score {analyst_mom['score']:+.1f}", signal_color("BULL" if analyst_mom["score"]>0 else "BEAR" if analyst_mom["score"]<0 else ""))
+        with a2: card("Upgrades", str(analyst_mom["upgrades"]), "30D")
+        with a3: card("Downgrades", str(analyst_mom["downgrades"]), "30D")
+        with a4: card("PT Raises", str(analyst_mom["pt_raises"]), "30D")
+        with a5: card("PT Cuts", str(analyst_mom["pt_cuts"]), "30D")
+        if analyst_events:
+            last = analyst_events[0]
+            st.caption(
+                f"Latest: {last.get('firm') or 'Analyst'} · "
+                f"{last.get('action_company') or last.get('action_pt') or 'rating update'} · "
+                f"{age_text(last.get('published_at'))}"
+            )
+        else:
+            st.caption("No Benzinga analyst-rating events stored for this ticker yet.")
 
     elif section=="Chart":
         feed=os.getenv("ALPACA_DATA_FEED","iex").lower()
@@ -1083,6 +1190,61 @@ elif area == "Research":
                 st.write(interp.term_view); st.write(interp.skew_view); st.write(interp.move_view)
                 dataframe_with_help(pd.DataFrame([{"30D IV":opt.iv_30d,"60D IV":opt.iv_60d,"90D IV":opt.iv_90d,"30→60":opt.term_slope_30_60,"60→90":opt.term_slope_60_90,"Put skew":opt.put_skew,"Call skew":opt.call_skew,"Source":opt.source,"Confidence":opt.confidence}]),use_container_width=True,hide_index=True)
             for c in interp.cautions: st.warning(c)
+
+    elif section=="Analyst Activity":
+        events, momentum = analyst_activity(ticker, 90)
+        st.markdown("### Analyst Activity")
+        st.caption("Benzinga sell-side rating and price-target actions. Analyst Momentum is a catalyst/confirmation layer and is not included in Tradeability yet.")
+
+        c1,c2,c3,c4,c5,c6=st.columns(6)
+        with c1: card("Analyst Momentum", momentum["state"], f"score {momentum['score']:+.1f}", signal_color("BULL" if momentum["score"]>0 else "BEAR" if momentum["score"]<0 else ""))
+        with c2: card("Analyst Events", str(momentum["events"]), "30D")
+        with c3: card("Upgrades", str(momentum["upgrades"]), "30D")
+        with c4: card("Downgrades", str(momentum["downgrades"]), "30D")
+        with c5: card("PT Raises", str(momentum["pt_raises"]), "30D")
+        with c6: card("PT Cuts", str(momentum["pt_cuts"]), "30D")
+
+        st.markdown(
+            "<div class='tv-small'>Scoring: upgrade +2 · downgrade −2 · bullish/bearish initiation ±1.5 · PT raise +1 · PT cut −1.</div>",
+            unsafe_allow_html=True,
+        )
+
+        if not events:
+            st.info("No analyst events are stored for this ticker yet. Configure MKTSCAN_BENZINGA_KEY on the scheduler service and wait for the next 15-minute market-hours refresh.")
+        else:
+            rows=[]
+            for e in events:
+                rows.append({
+                    "Date": e["published_at"].strftime("%Y-%m-%d %H:%M") if e.get("published_at") else "—",
+                    "Firm": e.get("firm") or "—",
+                    "Analyst": e.get("analyst_name") or "—",
+                    "Action": e.get("action_company") or "—",
+                    "Rating": (
+                        f"{e.get('rating_prior')} → {e.get('rating_current')}"
+                        if e.get("rating_prior") and e.get("rating_current") and e.get("rating_prior") != e.get("rating_current")
+                        else e.get("rating_current") or "—"
+                    ),
+                    "PT Action": e.get("action_pt") or "—",
+                    "PT Prior": f"${e['pt_prior']:.2f}" if e.get("pt_prior") is not None else "—",
+                    "PT Current": f"${e['pt_current']:.2f}" if e.get("pt_current") is not None else "—",
+                    "Importance": e.get("importance") if e.get("importance") is not None else "—",
+                })
+            dataframe_with_help(
+                pd.DataFrame(rows),
+                help_overrides={
+                    "Date": "Source: Benzinga Analyst Ratings API\\n\\nDefinition: Timestamp of the analyst action.\\n\\nHow to interpret: Rating actions can act as short-term catalysts; the price/volume reaction matters.",
+                    "Firm": "Source: Benzinga Analyst Ratings API\\n\\nDefinition: Sell-side research firm issuing the action.\\n\\nHow to interpret: Firm identity provides context; future validation can measure which firms/analysts add the most signal.",
+                    "Analyst": "Source: Benzinga Analyst Ratings API\\n\\nDefinition: Named analyst associated with the action when supplied.\\n\\nHow to interpret: Analyst identity is context only in v1; accuracy scoring is not yet included.",
+                    "Action": "Source: Benzinga Analyst Ratings API\\n\\nDefinition: Firm action such as Upgrade, Downgrade, Initiates or Maintains.\\n\\nHow to interpret: Upgrades/downgrades carry more weight in Analyst Momentum than reiterations.",
+                    "Rating": "Source: Benzinga Analyst Ratings API\\n\\nDefinition: Prior and current analyst rating language.\\n\\nHow to interpret: Benzinga does not normalize rating language; focus on the direction of change.",
+                    "PT Action": "Source: Benzinga Analyst Ratings API\\n\\nDefinition: Action on the price target, such as Raises or Lowers.\\n\\nHow to interpret: PT changes are useful secondary evidence but weaker than rating changes.",
+                    "PT Prior": "Source: Benzinga Analyst Ratings API\\n\\nDefinition: Previous analyst price target.\\n\\nHow to interpret: Compare with the current target and spot price, but do not treat a target as a forecast guarantee.",
+                    "PT Current": "Source: Benzinga Analyst Ratings API\\n\\nDefinition: New/current analyst price target.\\n\\nHow to interpret: A cluster of rising targets can confirm improving expectations; divergence from price momentum can be informative.",
+                    "Importance": "Source: Benzinga Analyst Ratings API\\n\\nDefinition: Benzinga importance score, 0–5.\\n\\nHow to interpret: Higher values can help prioritize events in a busy feed.",
+                },
+                use_container_width=True,
+                hide_index=True,
+            )
 
     elif section=="Trade Builder":
         st.caption("Expensive live chain access only runs when this view is opened.")
@@ -1238,7 +1400,7 @@ elif area == "Portfolio":
             elif sub=="History":
                 rows=[]
                 for t in trades:
-                    m=trade_metrics(t,t.status=="OPEN"); rows.append({"ID":t.id,"Date":t.opened_at.date(),"Ticker":t.ticker,"Strategy":t.strategy,"Status":t.status,"P&L":m.pnl if t.status=="OPEN" else t.realized_pnl,"ROR %":m.return_on_risk_pct if t.status=="OPEN" else t.return_on_risk_pct,"Regime":t.regime_label,"IV Pct":t.iv_percentile,"Signal":t.tradeability_label})
+                    m=trade_metrics(t,t.status=="OPEN"); rows.append({"ID":t.id,"Date":t.opened_at.date(),"Ticker":t.ticker,"Strategy":t.strategy,"Status":t.status,"P&L":m.pnl if t.status=="OPEN" else t.realized_pnl,"ROR %":m.return_on_risk_pct if t.status=="OPEN" else t.return_on_risk_pct,"Regime":t.regime_label,"IV Pct":t.iv_percentile,"Signal":t.tradeability_label,"Analyst":t.analyst_momentum_state})
                 dataframe_with_help(pd.DataFrame(rows),use_container_width=True,hide_index=True)
             else:
                 if not closed: st.info("Close trades to unlock attribution reviews.")
@@ -1255,7 +1417,14 @@ elif area == "Portfolio":
                     else: diagnosis="P&L POSITIVE DESPITE THESIS"
                     st.markdown(f"### {diagnosis}")
                     c1,c2,c3=st.columns(3); ui_metric(c1,"Underlying return",f"{underlying_ret:+.1f}%" if underlying_ret is not None else "—"); ui_metric(c2,"Trade P&L",f"${pnl:,.0f}"); ui_metric(c3,"Return on risk",f"{t.return_on_risk_pct:+.1f}%" if t.return_on_risk_pct is not None else "—")
-                    st.caption(f"Entry signal {t.tradeability_label or '—'} · regime {t.regime_label or '—'} · IV pct {t.iv_percentile if t.iv_percentile is not None else '—'}")
+                    st.caption(
+                        f"Entry signal {t.tradeability_label or '—'} · regime {t.regime_label or '—'} · "
+                        f"IV pct {t.iv_percentile if t.iv_percentile is not None else '—'} · "
+                        f"analyst momentum {t.analyst_momentum_state or '—'} "
+                        f"({t.analyst_momentum_score:+.1f})" if t.analyst_momentum_score is not None else
+                        f"Entry signal {t.tradeability_label or '—'} · regime {t.regime_label or '—'} · "
+                        f"IV pct {t.iv_percentile if t.iv_percentile is not None else '—'} · analyst momentum —"
+                    )
     finally:
         s.close()
 
@@ -1299,7 +1468,7 @@ elif area == "Validation":
             closed=s.execute(select(TradeJournalEntry).where(TradeJournalEntry.status=="CLOSED")).scalars().all()
             if not closed: st.info("No closed journal trades yet.")
             else:
-                df=pd.DataFrame([{"Ticker":t.ticker,"Strategy":t.strategy,"P&L":t.realized_pnl or 0,"ROR":t.return_on_risk_pct,"Regime":t.regime_label or "Unknown","IV Pct":t.iv_percentile,"Signal":t.tradeability_label or "Unknown"} for t in closed])
+                df=pd.DataFrame([{"Ticker":t.ticker,"Strategy":t.strategy,"P&L":t.realized_pnl or 0,"ROR":t.return_on_risk_pct,"Regime":t.regime_label or "Unknown","IV Pct":t.iv_percentile,"Signal":t.tradeability_label or "Unknown","Analyst Momentum":t.analyst_momentum_state or "Unknown"} for t in closed])
                 left,right=st.columns(2)
                 with left:
                     st.markdown("#### By strategy"); dataframe_with_help(df.groupby("Strategy").agg(N=("Ticker","size"),PnL=("P&L","sum"),Avg_ROR=("ROR","mean")).reset_index().sort_values("PnL",ascending=False),use_container_width=True,hide_index=True)
@@ -1309,5 +1478,16 @@ elif area == "Validation":
                     df["IV Bucket"]=pd.cut(df["IV Pct"],[-1,20,40,60,80,101],labels=["<20","20-40","40-60","60-80","80+"])
                     st.markdown("#### By IV percentile")
                     dataframe_with_help(df.groupby("IV Bucket",observed=True).agg(N=("Ticker","size"),PnL=("P&L","sum"),Avg_ROR=("ROR","mean")).reset_index(),use_container_width=True,hide_index=True)
+                if (df["Analyst Momentum"] != "Unknown").any():
+                    st.markdown("#### By analyst momentum at entry")
+                    dataframe_with_help(
+                        df.groupby("Analyst Momentum").agg(
+                            N=("Ticker","size"),
+                            PnL=("P&L","sum"),
+                            Avg_ROR=("ROR","mean"),
+                        ).reset_index().sort_values("PnL",ascending=False),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
     finally:
         s.close()

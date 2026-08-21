@@ -15,6 +15,9 @@ scraper:
   # Lightweight Yahoo price/regime refresh. This is intentionally more frequent
   # than the full scrape so dashboard prices and regime context do not look stale.
   price_schedule: "*/10 13-21 * * 1-5"
+  # Benzinga analyst ratings refresh. The scheduler itself enforces 09:30–16:00
+  # America/New_York and runs every 15 minutes during that window.
+  analyst_schedule: "*/15"
   user_agent: "MktScan/1.0 (personal research tool)"
   timeout_seconds: 15
 
@@ -51,7 +54,7 @@ sources:
     fetch_news: true
 
   benzinga:
-    enabled: false             # Enable when you have Benzinga Pro (~$50/mo)
+    enabled: false             # General Benzinga news/earnings source; analyst job can use the API key independently
     method: api
     api_key: "YOUR_BENZINGA_KEY"
     base_url: "https://api.benzinga.com/api/v2"

@@ -14,11 +14,13 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .database import (
+    AnalystRatingEvent,
     MarketRegimeSnapshot,
     OptionsMarketSnapshot,
     TradeJournalEntry,
     TradeabilityOutcome,
 )
+from .analyst_ratings import get_analyst_momentum
 
 
 @dataclass(frozen=True)
@@ -73,6 +75,8 @@ def capture_entry_context(session: Session, ticker: str, opened_at: datetime) ->
         .limit(1)
     ).scalar_one_or_none()
 
+    analyst = get_analyst_momentum(session, ticker, as_of=opened_at, days=30)
+
     return {
         "tradeability_score": _native_float(pred.score_at_prediction) if pred else None,
         "tradeability_label": pred.label_at_prediction if pred else None,
@@ -91,6 +95,14 @@ def capture_entry_context(session: Session, ticker: str, opened_at: datetime) ->
         "expected_move_pct": _native_float(options.expected_move_pct) if options else None,
         "options_source": options.source if options else None,
         "options_snapshot_id": options.id if options else None,
+        "analyst_snapshot_at": opened_at,
+        "analyst_momentum_score": _native_float(analyst.get("score")),
+        "analyst_momentum_state": analyst.get("state"),
+        "analyst_events_30d": int(analyst.get("events") or 0),
+        "analyst_upgrades_30d": int(analyst.get("upgrades") or 0),
+        "analyst_downgrades_30d": int(analyst.get("downgrades") or 0),
+        "analyst_pt_raises_30d": int(analyst.get("pt_raises") or 0),
+        "analyst_pt_cuts_30d": int(analyst.get("pt_cuts") or 0),
     }
 
 

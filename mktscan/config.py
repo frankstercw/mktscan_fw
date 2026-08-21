@@ -110,6 +110,7 @@ def _apply_env_overrides(cfg: dict) -> None:
         "MKTSCAN_SENTIMENT_MODEL": ("sentiment", "model"),
         "MKTSCAN_SCHEDULE":        ("scraper", "schedule"),
         "MKTSCAN_PRICE_SCHEDULE":  ("scraper", "price_schedule"),
+        "MKTSCAN_ANALYST_SCHEDULE": ("scraper", "analyst_schedule"),
         "MKTSCAN_DELAY_SECONDS":   ("scraper", "delay_seconds"),
         "MKTSCAN_MAX_ARTICLES":    ("scraper", "max_articles_per_source"),
         "MKTSCAN_LOG_LEVEL":       ("logging", "level"),

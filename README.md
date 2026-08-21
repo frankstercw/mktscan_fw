@@ -566,3 +566,8 @@ These presentation layers do not change the underlying tradeability model weight
 ## Dashboard v2.2
 - MarketWatch major macro events on Key Events.
 - Full on-demand MktScan review for any supported ticker from the sidebar.
+
+
+## Analyst Ratings v1
+
+Set `MKTSCAN_BENZINGA_KEY` on the scheduler service to enable Benzinga analyst-rating ingestion. MktScan refreshes basket + open-position tickers every 15 minutes during the U.S. regular session, stores rating/price-target actions, calculates a 30-day Analyst Momentum state, surfaces actions in Research and What's Changed, and snapshots the state into new Trade Journal entries.

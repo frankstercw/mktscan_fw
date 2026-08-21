@@ -172,6 +172,49 @@ def run_scheduled(cfg: dict[str, Any] | None = None, interval_minutes: int | Non
             console.print(f"[yellow]⚠ IV snapshot update failed: {iv_err}[/yellow]")
             log.warning(f"IV snapshot update failed: {iv_err}")
 
+    def analyst_ratings_job():
+        """Refresh Benzinga analyst actions for basket + open journal positions.
+
+        The APScheduler trigger runs every configured quarter-hour between
+        09:00 and 16:59 New York time; this guard narrows execution to the
+        actual regular session (09:30–16:00) and handles DST naturally.
+        """
+        from datetime import datetime as _datetime, time as _time
+        from zoneinfo import ZoneInfo
+
+        now_et = _datetime.now(ZoneInfo("America/New_York"))
+        if not (_time(9, 30) <= now_et.time().replace(tzinfo=None) <= _time(16, 0)):
+            return
+
+        console.print("[cyan]▶ Analyst ratings refresh...[/cyan]")
+        try:
+            from .analyst_ratings import analyst_watch_tickers, refresh_analyst_ratings
+            from .database import get_session, init_db
+
+            init_db()
+            session = get_session()
+            try:
+                tickers = analyst_watch_tickers(session)
+                result = refresh_analyst_ratings(session, tickers)
+            finally:
+                session.close()
+
+            if not result.get("enabled"):
+                console.print(f"[dim]Analyst ratings disabled — {result.get('reason', 'no Benzinga key')}[/dim]")
+                return
+
+            console.print(
+                f"[green]✓ Analyst ratings refreshed[/green] — "
+                f"{result.get('tickers', 0)} tickers, "
+                f"{result.get('events', 0)} events, "
+                f"{result.get('inserted', 0)} new"
+            )
+            for err in result.get("errors", [])[:3]:
+                console.print(f"  [yellow]⚠ {err}[/yellow]")
+        except Exception as exc:
+            console.print(f"[red]✗ Analyst ratings refresh failed: {exc}[/red]")
+            log.exception("Analyst ratings refresh failed")
+
     def backtest_job():
         """Weekly incremental backtest — runs every Sunday at 02:00 UTC."""
         console.print("[cyan]▶ Weekly backtest starting...[/cyan]")
@@ -225,6 +268,27 @@ def run_scheduled(cfg: dict[str, Any] | None = None, interval_minutes: int | Non
 
     from apscheduler.triggers.cron import CronTrigger as _CronTrigger
 
+    analyst_minute = str(cfg.get("scraper", {}).get("analyst_schedule", "*/15")).strip()
+    # Accept either a simple minute expression (recommended) or a five-part
+    # cron; the job still applies the New York regular-session guard.
+    if " " in analyst_minute:
+        analyst_parts = analyst_minute.split()
+        analyst_minute = analyst_parts[0] if len(analyst_parts) == 5 else "*/15"
+    scheduler.add_job(
+        analyst_ratings_job,
+        trigger=_CronTrigger(
+            day_of_week="mon-fri",
+            hour="9-16",
+            minute=analyst_minute,
+            timezone="America/New_York",
+        ),
+        id="mktscan_analyst_ratings",
+        name="MktScan Benzinga analyst ratings",
+        misfire_grace_time=300,
+        coalesce=True,
+        max_instances=1,
+    )
+
     # ── Daily IV snapshot — weekdays at 21:15 UTC (≈16:15 ET, after the close) ─
     scheduler.add_job(
         iv_snapshot_job,
@@ -257,6 +321,14 @@ def run_scheduled(cfg: dict[str, Any] | None = None, interval_minutes: int | Non
         name="MktScan one-time IV seed check",
         misfire_grace_time=3600,
     )
+    scheduler.add_job(
+        analyst_ratings_job,
+        trigger="date",
+        run_date=_dt.utcnow() + _td(seconds=35),
+        id="mktscan_analyst_startup",
+        name="MktScan analyst ratings startup check",
+        misfire_grace_time=600,
+    )
 
     # ── Health check HTTP server (required by Railway) ───────────────────────
     import os as _os, threading as _threading
@@ -281,6 +353,7 @@ def run_scheduled(cfg: dict[str, Any] | None = None, interval_minutes: int | Non
 
     console.print(f"[bold cyan]MktScan Scheduler[/bold cyan] — full refresh {trigger_desc} (UTC)")
     console.print(f"[dim]  + price/regime refresh {price_trigger_desc} (UTC)[/dim]")
+    console.print("[dim]  + analyst ratings every 15m during 09:30–16:00 America/New_York[/dim]")
     console.print("[dim]  + daily IV snapshot at 21:15 UTC (weekdays)[/dim]")
     console.print("[dim]  + weekly backtest Sunday 02:00 UTC[/dim]")
     console.print("[dim]Press Ctrl+C to stop[/dim]")

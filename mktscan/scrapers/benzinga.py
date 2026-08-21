@@ -114,28 +114,61 @@ class BenzingaScraper:
 
         return results
 
-    def fetch_ratings(self, ticker: str) -> list[dict]:
-        """Analyst rating changes."""
+    def fetch_ratings(self, ticker: str, lookback_days: int = 30, max_items: int = 100) -> list[dict]:
+        """Fetch Benzinga analyst rating and price-target actions.
+
+        Endpoint documented by Benzinga:
+        GET /api/v2/calendar/ratings
+        """
         results = []
-        date_from = (datetime.utcnow() - timedelta(days=30)).strftime("%Y-%m-%d")
+        date_from = (datetime.utcnow() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+        date_to = datetime.utcnow().strftime("%Y-%m-%d")
 
         try:
-            data = self._get("ratings/analysts", {
+            data = self._get("calendar/ratings", {
                 "parameters[tickers]": ticker,
                 "parameters[dateFrom]": date_from,
+                "parameters[dateTo]": date_to,
+                "pagesize": min(max_items, 1000),
             })
 
             items = (data.get("ratings") or []) if isinstance(data, dict) else []
-            for item in items:
+            for item in items[:max_items]:
+                published_at = None
+                updated = item.get("updated")
+                if updated is not None:
+                    try:
+                        ts = float(updated)
+                        # Benzinga's updated field is documented as Unix time;
+                        # tolerate millisecond/microsecond representations too.
+                        while ts > 10_000_000_000:
+                            ts /= 1000.0
+                        published_at = datetime.utcfromtimestamp(ts)
+                    except (TypeError, ValueError, OSError):
+                        published_at = None
+                if published_at is None:
+                    date_part = str(item.get("date") or "")
+                    time_part = str(item.get("time") or "")
+                    published_at = self._parse_date(
+                        f"{date_part} {time_part}".strip()
+                    ) or self._parse_date(date_part)
+
                 results.append({
-                    "ticker":   ticker,
-                    "analyst":  item.get("analyst", ""),
-                    "firm":     item.get("analyst_name", ""),
-                    "action":   item.get("action_company", ""),
-                    "rating":   item.get("rating_current", ""),
-                    "pt":       self._safe_float(item.get("pt_current")),
-                    "date":     self._parse_date(item.get("date", "")),
-                    "source":   "benzinga",
+                    "external_id": str(item.get("id") or ""),
+                    "ticker": str(item.get("ticker") or ticker).upper(),
+                    "published_at": published_at or datetime.utcnow(),
+                    "firm": item.get("analyst") or "",
+                    "analyst_name": item.get("analyst_name") or "",
+                    "action_company": item.get("action_company") or "",
+                    "action_pt": item.get("action_pt") or "",
+                    "rating_prior": item.get("rating_prior") or "",
+                    "rating_current": item.get("rating_current") or "",
+                    "pt_prior": self._safe_float(item.get("pt_prior")),
+                    "pt_current": self._safe_float(item.get("pt_current")),
+                    "importance": self._safe_int(item.get("importance")),
+                    "url": item.get("url") or item.get("url_news") or item.get("url_calendar") or "",
+                    "source": "benzinga",
+                    "raw": item,
                 })
         except Exception as e:
             log.error(f"[Benzinga] Ratings failed for {ticker}: {e}")
@@ -152,10 +185,17 @@ class BenzingaScraper:
             return None
 
     @staticmethod
+    def _safe_int(val) -> int | None:
+        try:
+            return int(float(val))
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
     def _parse_date(s: str) -> datetime | None:
         if not s:
             return None
-        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
             try:
                 return datetime.strptime(s[:19], fmt)
             except ValueError:
