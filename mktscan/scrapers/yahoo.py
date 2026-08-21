@@ -212,6 +212,20 @@ class YahooScraper:
         # Clamp: a 4000% "surprise" off a $0.01 estimate is noise, not signal.
         return round(max(-200.0, min(200.0, pct)), 4)
 
+    def fetch_earnings_calendar(self, ticker: str) -> list[dict]:
+        """Fetch only the earnings calendar/history for a ticker.
+
+        This is intentionally lighter than ``fetch_ticker`` so the Key Events
+        page can refresh upcoming earnings without also pulling news/prices.
+        """
+        try:
+            import yfinance as yf
+            t = yf.Ticker(ticker)
+            return self._parse_earnings(ticker, t)
+        except Exception as exc:
+            log.debug(f"[Yahoo] Earnings calendar fetch failed for {ticker}: {exc}")
+            return []
+
     def _parse_earnings(self, ticker: str, t: Any) -> list[dict]:
         events = []
         try:

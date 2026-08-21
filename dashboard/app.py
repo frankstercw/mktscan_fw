@@ -1008,38 +1008,73 @@ elif area == "Market Performance":
             )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# KEY EVENTS — macro + earnings calendar
+# KEY EVENTS — combined legacy economic + earnings calendars
 # ─────────────────────────────────────────────────────────────────────────────
 elif area == "Key Events":
     st.markdown("## Key Events")
-    st.caption("Major U.S. economic events from the MarketWatch economic calendar plus upcoming basket earnings. Event times are normalized to UTC.")
+    st.caption(
+        "The old MktScan Economic Calendar and Earnings Calendar are combined here. "
+        "Economic events come from the persisted macro calendar; earnings come from "
+        "the configured MktScan basket's Yahoo earnings calendar."
+    )
 
-    k1, k2 = st.columns([1, 3])
-    with k1:
-        if st.button("Refresh Economic Calendar", use_container_width=True):
+    # Refresh controls mirror the old dashboard's two data feeds.
+    rc1, rc2, rc3 = st.columns([1, 1, 3])
+    with rc1:
+        if st.button("Refresh Economic", use_container_width=True):
             try:
                 from mktscan.macro import refresh_economic_calendar
                 s = get_session()
                 try:
                     with st.spinner("Refreshing economic calendar…"):
                         result = refresh_economic_calendar(s)
-                    total = result.get("marketwatch_events", 0) + result.get("benzinga_events", 0)
-                    source = result.get("source") or "none"
-                    if total:
-                        st.success(f"Economic calendar: {total} events refreshed via {source}.")
-                    else:
-                        st.warning(
-                            "No economic events were returned. MarketWatch may be blocking the Railway IP; "
-                            "the Benzinga fallback also requires an Economic Calendar entitlement."
-                        )
                 finally:
                     s.close()
-                st.cache_data.clear()
-                st.rerun()
+                key_events_between.clear()
+                total = result.get("marketwatch_events", 0) + result.get("benzinga_events", 0)
+                if total:
+                    st.success(f"{total} economic events refreshed via {result.get('source') or 'calendar provider'}.")
+                else:
+                    st.warning("No economic events were returned by MarketWatch or the configured fallback.")
             except Exception as exc:
-                st.error(f"Economic-calendar refresh failed: {exc}")
-    with k2:
-        st.caption("MarketWatch is primary. If it returns no rows, MktScan falls back to Benzinga Economics when the configured key has that entitlement.")
+                st.error(f"Economic refresh failed: {exc}")
+
+    with rc2:
+        if st.button("Refresh Earnings", use_container_width=True):
+            try:
+                from mktscan.earnings_calendar import refresh_earnings_calendar
+                s = get_session()
+                try:
+                    with st.spinner("Refreshing basket earnings dates…"):
+                        result = refresh_earnings_calendar(s, basket_symbols)
+                finally:
+                    s.close()
+                key_events_between.clear()
+                if result.get("upcoming", 0):
+                    st.success(
+                        f"{result['upcoming']} upcoming earnings events refreshed "
+                        f"across {result['tickers']} basket tickers."
+                    )
+                else:
+                    st.warning(
+                        "Yahoo returned no upcoming earnings dates for the current basket. "
+                        "The stored calendar below will still show any existing events."
+                    )
+            except Exception as exc:
+                st.error(f"Earnings refresh failed: {exc}")
+
+    with rc3:
+        st.caption(
+            "Economic: MarketWatch primary, Benzinga Economics fallback when entitled. "
+            "Earnings: Yahoo Finance for the configured MktScan basket."
+        )
+
+    view = st.radio(
+        "Calendar view",
+        ["Combined Calendar", "Economic Calendar", "Earnings Calendar"],
+        horizontal=True,
+        label_visibility="collapsed",
+    )
 
     today = date.today()
     months = []
@@ -1048,16 +1083,18 @@ elif area == "Key Events":
         m = (today.month - 1 + offset) % 12 + 1
         months.append((y, m))
     labels = [datetime(y, m, 1).strftime("%B %Y") for y, m in months]
-    default_idx = next((i for i, (y,m) in enumerate(months) if y == today.year and m == today.month), 0)
+    default_idx = next(
+        (i for i, (y, m) in enumerate(months) if y == today.year and m == today.month),
+        0,
+    )
     chosen = st.selectbox("Calendar month", labels, index=default_idx)
     year, month = months[labels.index(chosen)]
 
     start_at = datetime(year, month, 1)
     end_at = datetime(year + 1, 1, 1) if month == 12 else datetime(year, month + 1, 1)
 
-    # Self-heal an empty economic calendar instead of silently rendering a
-    # blank page. MarketWatch is primary; Benzinga Economics is a fallback
-    # when configured and MarketWatch is unavailable.
+    # If either legacy feed is empty for the current/future month, attempt one
+    # self-healing refresh before rendering a blank calendar.
     s = get_session()
     try:
         econ_count = s.execute(
@@ -1066,47 +1103,131 @@ elif area == "Key Events":
                 MacroEvent.event_at < end_at,
             )
         ).scalar_one()
-        calendar_refresh_result = None
-        if not econ_count:
-            from mktscan.macro import refresh_economic_calendar
-            with st.spinner("Loading economic calendar…"):
-                calendar_refresh_result = refresh_economic_calendar(s)
-            key_events_between.clear()
+        earn_count = s.execute(
+            select(func.count(EarningsEvent.id)).where(
+                EarningsEvent.report_date >= start_at,
+                EarningsEvent.report_date < end_at,
+                EarningsEvent.is_upcoming == True,  # noqa: E712
+            )
+        ).scalar_one()
+
+        if not econ_count and end_at >= datetime.utcnow():
+            try:
+                from mktscan.macro import refresh_economic_calendar
+                refresh_economic_calendar(s)
+            except Exception:
+                pass
+
+        if not earn_count and end_at >= datetime.utcnow():
+            try:
+                from mktscan.earnings_calendar import refresh_earnings_calendar
+                refresh_earnings_calendar(s, basket_symbols)
+            except Exception:
+                pass
     finally:
         s.close()
 
-    events = key_events_between(start_at, end_at)
-    if calendar_refresh_result and not any(e["kind"] == "ECON" for e in events):
-        st.warning(
-            "Economic calendar is still empty. MarketWatch returned "
-            f"{calendar_refresh_result.get('marketwatch_events', 0)} events and the "
-            f"Benzinga fallback returned {calendar_refresh_result.get('benzinga_events', 0)}. "
-            "Check Railway outbound access and, if using the fallback, the Benzinga Economic Calendar entitlement."
+    key_events_between.clear()
+    all_events = key_events_between(start_at, end_at)
+
+    econ_events = [e for e in all_events if e["kind"] == "ECON"]
+    earnings_events = [
+        e for e in all_events
+        if e["kind"] == "EARN" and e["at"] >= datetime.utcnow() - timedelta(days=1)
+    ]
+
+    # Current calendar display follows selected legacy view.
+    if view == "Economic Calendar":
+        events = econ_events
+    elif view == "Earnings Calendar":
+        events = earnings_events
+    else:
+        events = econ_events + earnings_events
+        events = sorted(events, key=lambda x: x["at"])
+
+    econ_major_only = False
+    if view in {"Combined Calendar", "Economic Calendar"}:
+        econ_major_only = st.toggle(
+            "Major economic events only",
+            value=False,
+            help=(
+                "Off reproduces the fuller legacy economic calendar. "
+                "Turn on to keep only High/Medium importance macro releases."
+            ),
         )
-    major_only = st.toggle(
-        "Major macro events only",
-        value=True,
-        help="Includes MarketWatch events classified High or Medium importance. Earnings are always retained.",
-    )
-    if major_only:
-        events = [
-            e for e in events
-            if e["kind"] == "EARN"
-            or str(e.get("importance") or "").upper() in {"HIGH", "MEDIUM"}
-        ]
+        if econ_major_only:
+            events = [
+                e for e in events
+                if e["kind"] == "EARN"
+                or str(e.get("importance") or "").upper() in {"HIGH", "MEDIUM"}
+            ]
+
+    # Summary cards give immediate confirmation that both old feeds are present.
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        card(
+            "Economic Events",
+            str(len(econ_events)),
+            chosen,
+            help_text=metric_help(
+                "Economic Events",
+                "MktScan MacroEvent table; MarketWatch primary",
+                "Stored macroeconomic releases/events occurring in the selected month.",
+                "Use High/Medium releases such as CPI, PCE, payrolls, GDP, ISM and FOMC as explicit event-risk windows.",
+            ),
+        )
+    with m2:
+        high_n = sum(str(e.get("importance") or "").upper() == "HIGH" for e in econ_events)
+        card(
+            "High Impact",
+            str(high_n),
+            "economic events",
+            help_text=metric_help(
+                "High Impact",
+                "MktScan macro-event importance classifier",
+                "Count of selected-month economic events classified High importance.",
+                "High-impact events are most likely to produce broad index, rates and implied-volatility repricing.",
+            ),
+        )
+    with m3:
+        card(
+            "Upcoming Earnings",
+            str(len(earnings_events)),
+            "basket events",
+            help_text=metric_help(
+                "Upcoming Earnings",
+                "Yahoo Finance earnings calendar via MktScan EarningsEvent",
+                "Upcoming company earnings dates for tickers in the configured MktScan basket.",
+                "Treat earnings inside the intended option holding period as binary/event risk; IV can rise materially into the report.",
+            ),
+        )
+    with m4:
+        next_event = min(events, key=lambda e: e["at"], default=None)
+        card(
+            "Next Key Event",
+            next_event["title"][:28] if next_event else "None",
+            next_event["at"].strftime("%b %d · %H:%M UTC") if next_event else chosen,
+            help_text=metric_help(
+                "Next Key Event",
+                "Combined MktScan economic + earnings calendars",
+                "Chronologically nearest event in the selected calendar view.",
+                "Use it to avoid entering a position without knowing the nearest scheduled binary or macro catalyst.",
+            ),
+        )
+
+    # ── Calendar grid ────────────────────────────────────────────────────────
+    st.markdown('<div class="tv-section">Calendar</div>', unsafe_allow_html=True)
     events_by_day: dict[int, list[dict]] = {}
     for e in events:
         events_by_day.setdefault(e["at"].day, []).append(e)
 
-    st.markdown(
-        '<div class="tv-small">ⓘ ECON = economic release / central-bank event · EARN = upcoming basket earnings.</div>',
-        unsafe_allow_html=True,
-    )
-
-    weekday_labels = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
+    weekday_labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
     hdr = st.columns(7)
     for i, wd in enumerate(weekday_labels):
-        hdr[i].markdown(f"<div class='tv-kicker' style='text-align:center'>{wd}</div>", unsafe_allow_html=True)
+        hdr[i].markdown(
+            f"<div class='tv-kicker' style='text-align:center'>{wd}</div>",
+            unsafe_allow_html=True,
+        )
 
     cal = calendar.Calendar(firstweekday=0)
     for week in cal.monthdayscalendar(year, month):
@@ -1114,69 +1235,138 @@ elif area == "Key Events":
         for i, day_num in enumerate(week):
             with cols[i]:
                 if day_num == 0:
-                    st.markdown("<div style='min-height:118px'></div>", unsafe_allow_html=True)
+                    st.markdown("<div style='min-height:128px'></div>", unsafe_allow_html=True)
                     continue
-                is_today = (year == today.year and month == today.month and day_num == today.day)
+
+                is_today = year == today.year and month == today.month and day_num == today.day
                 border = "border-color:#2962ff;" if is_today else ""
                 day_events = events_by_day.get(day_num, [])
                 pills = []
-                for e in day_events[:4]:
+
+                for e in day_events[:5]:
                     if e["kind"] == "EARN":
                         cls = "tv-blue"
-                    elif str(e.get("importance") or "").upper() == "HIGH":
-                        cls = "tv-bear"
+                        short = e["ticker"] or e["title"]
+                        prefix = "EARN"
                     else:
-                        cls = "tv-warn"
-                    label = (e["ticker"] if e["kind"] == "EARN" else e["title"])[:18]
-                    pills.append(f"<div class='tv-pill {cls}' style='display:block;margin:4px 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap'>{e['kind']} · {label}</div>")
-                if len(day_events) > 4:
-                    pills.append(f"<div class='tv-small'>+{len(day_events)-4} more</div>")
+                        imp = str(e.get("importance") or "").upper()
+                        cls = "tv-bear" if imp == "HIGH" else "tv-warn"
+                        short = e["title"]
+                        prefix = "ECON"
+                    pills.append(
+                        f"<div class='tv-pill {cls}' "
+                        f"style='display:block;margin:4px 0;overflow:hidden;"
+                        f"text-overflow:ellipsis;white-space:nowrap' "
+                        f"title='{e['title']}'>{prefix} · {short[:18]}</div>"
+                    )
+
+                if len(day_events) > 5:
+                    pills.append(f"<div class='tv-small'>+{len(day_events)-5} more</div>")
+
                 st.markdown(
-                    f"<div class='tv-card' style='min-height:118px;{border}'><div class='tv-kicker'>{day_num}</div>{''.join(pills)}</div>",
+                    f"<div class='tv-card' style='min-height:128px;{border}'>"
+                    f"<div class='tv-kicker'>{day_num}</div>{''.join(pills)}</div>",
                     unsafe_allow_html=True,
                 )
 
-    st.markdown('<div class="tv-section">Event details</div>', unsafe_allow_html=True)
-    kind_filter = st.radio("Event type", ["All","Economic","Earnings"], horizontal=True, label_visibility="collapsed")
-    filtered = [
-        e for e in events
-        if kind_filter == "All"
-        or (kind_filter == "Economic" and e["kind"] == "ECON")
-        or (kind_filter == "Earnings" and e["kind"] == "EARN")
-    ]
-    if not filtered:
-        st.info("No stored events for this month.")
-    else:
-        detail_rows = []
-        for e in filtered:
-            detail_rows.append({
-                "Date": e["at"].strftime("%Y-%m-%d"),
-                "Time UTC": e["at"].strftime("%H:%M"),
-                "Type": "Economic" if e["kind"] == "ECON" else "Earnings",
-                "Event": e["title"],
-                "Importance": e["importance"],
-                "Consensus": e["consensus"] or "—",
-                "Prior": e["prior"] or "—",
-                "Actual": e["actual"] or "—",
-                "Source": e["source"],
-            })
-        event_df = pd.DataFrame(detail_rows)
-        dataframe_with_help(
-            event_df,
-            help_overrides={
-                "Date": metric_help("Event Date", "MktScan macro/earnings calendar", "Calendar date of the scheduled event.", "Events close to an intended trade horizon deserve explicit event-risk planning."),
-                "Time UTC": metric_help("Event Time", "MktScan macro/earnings calendar", "Scheduled event time stored in UTC.", "Translate it to your local workflow; earnings timestamps can be less precise than macro release times."),
-                "Type": metric_help("Event Type", "MktScan macro/earnings calendar", "Distinguishes macroeconomic events from company earnings.", "Macro events can affect the whole market; earnings are primarily ticker-specific but can move sectors."),
-                "Event": metric_help("Event", "MarketWatch/economic sources or Yahoo Finance earnings", "Name of the macro release or ticker earnings event.", "Use it to identify binary/event risk that may change volatility and invalidate normal signals."),
-                "Importance": metric_help("Importance", "Calendar source", "Source-provided event importance/category.", "Higher-importance macro events generally deserve more caution around entries and sizing."),
-                "Consensus": metric_help("Consensus", "Calendar source / analyst estimates", "Pre-event consensus estimate where available.", "The market reaction often depends on actual-vs-consensus and revisions, not merely the reported number."),
-                "Prior": metric_help("Prior", "Calendar source", "Previous reported value where available.", "Compare with consensus and actual to understand acceleration/deceleration."),
-                "Actual": metric_help("Actual", "Calendar source", "Reported result once available.", "Interpret relative to consensus, prior and market positioning; a beat can still produce a negative price reaction."),
-                "Source": metric_help("Source", "MktScan provenance metadata", "Upstream provider used for the stored event.", "Use provenance and freshness to judge confidence, especially when event times change."),
-            },
-            use_container_width=True,
-            hide_index=True,
-        )
+    # ── Legacy Economic Calendar detail view ─────────────────────────────────
+    if view in {"Combined Calendar", "Economic Calendar"}:
+        st.markdown('<div class="tv-section">Economic Calendar</div>', unsafe_allow_html=True)
+        if not econ_events:
+            st.warning(
+                "No economic events are stored for this month. Use **Refresh Economic** above. "
+                "If it remains empty, inspect scheduler logs for MarketWatch/Benzinga calendar diagnostics."
+            )
+        else:
+            economic_rows = []
+            for e in econ_events:
+                economic_rows.append({
+                    "Date": e["at"].strftime("%Y-%m-%d"),
+                    "Time UTC": e["at"].strftime("%H:%M"),
+                    "Event": e["title"],
+                    "Category": e.get("category") or "Economic",
+                    "Importance": e.get("importance") or "Normal",
+                    "Consensus": e.get("consensus") or "—",
+                    "Prior": e.get("prior") or "—",
+                    "Actual": e.get("actual") or "—",
+                    "Source": e.get("source") or "—",
+                })
+            econ_df = pd.DataFrame(economic_rows)
+            if econ_major_only:
+                econ_df = econ_df[
+                    econ_df["Importance"].astype(str).str.upper().isin(["HIGH", "MEDIUM"])
+                ]
+            dataframe_with_help(
+                econ_df,
+                help_overrides={
+                    "Date": "Source: MktScan MacroEvent. Definition: Scheduled calendar date. How to interpret: Track proximity to planned entries and expirations.",
+                    "Time UTC": "Source: Calendar provider normalized by MktScan. Definition: Scheduled release time in UTC. How to interpret: Convert to local market time when planning entries.",
+                    "Event": "Source: MarketWatch primary; fallback provider when used. Definition: Named macro release or policy event. How to interpret: CPI/PCE/jobs/FOMC/ISM/GDP can materially alter rates, index direction and IV.",
+                    "Category": "Source: MktScan event classifier/provider. Definition: Macro-event grouping. How to interpret: Helps identify whether the event primarily relates to inflation, labor, growth, housing or policy.",
+                    "Importance": "Source: MktScan/provider classification. Definition: Expected market relevance. How to interpret: High-impact releases warrant the greatest event-risk caution.",
+                    "Consensus": "Source: Calendar provider. Definition: Pre-release market consensus where available. How to interpret: Price reactions are often driven by actual-versus-consensus and revisions.",
+                    "Prior": "Source: Calendar provider. Definition: Previous reading. How to interpret: Compare with consensus/actual to identify acceleration or deceleration.",
+                    "Actual": "Source: Calendar provider. Definition: Released value after publication. How to interpret: Interpret relative to consensus, prior and positioning rather than in isolation.",
+                    "Source": "Source: MktScan provenance field. Definition: Upstream provider that populated the event. How to interpret: Useful for diagnosing freshness and provider fallback behavior.",
+                },
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    # ── Legacy Earnings Calendar detail view ─────────────────────────────────
+    if view in {"Combined Calendar", "Earnings Calendar"}:
+        st.markdown('<div class="tv-section">Upcoming Earnings</div>', unsafe_allow_html=True)
+
+        s = get_session()
+        try:
+            stored_earnings = s.execute(
+                select(EarningsEvent)
+                .where(
+                    EarningsEvent.report_date >= start_at,
+                    EarningsEvent.report_date < end_at,
+                    EarningsEvent.is_upcoming == True,  # noqa: E712
+                    EarningsEvent.ticker.in_(basket_symbols),
+                )
+                .order_by(EarningsEvent.report_date, EarningsEvent.ticker)
+            ).scalars().all()
+        finally:
+            s.close()
+
+        if not stored_earnings:
+            st.warning(
+                "No upcoming basket earnings are stored for this month. "
+                "Use **Refresh Earnings** above to query Yahoo Finance."
+            )
+        else:
+            earning_rows = []
+            for r in stored_earnings:
+                earning_rows.append({
+                    "Date": r.report_date.strftime("%Y-%m-%d") if r.report_date else "—",
+                    "Ticker": r.ticker,
+                    "EPS Estimate": r.eps_estimate,
+                    "Status": "Upcoming" if r.is_upcoming else "Reported",
+                    "Last Updated": (
+                        r.updated_at.strftime("%Y-%m-%d %H:%M")
+                        if r.updated_at else
+                        r.scraped_at.strftime("%Y-%m-%d %H:%M")
+                        if r.scraped_at else "—"
+                    ),
+                    "Source": "Yahoo Finance",
+                })
+            earnings_df = pd.DataFrame(earning_rows)
+            dataframe_with_help(
+                earnings_df,
+                help_overrides={
+                    "Date": "Source: Yahoo Finance earnings calendar. Definition: Scheduled earnings report date. How to interpret: Earnings inside your trade horizon introduce binary gap and IV-crush risk.",
+                    "Ticker": "Source: MktScan configured basket. Definition: Company reporting earnings. How to interpret: Cross-reference with open trades and current setup quality.",
+                    "EPS Estimate": "Source: Yahoo Finance analyst consensus where available. Definition: Consensus EPS estimate before the report. How to interpret: Actual-vs-estimate and guidance usually matter more than the estimate alone.",
+                    "Status": "Source: MktScan EarningsEvent. Definition: Whether the report is still upcoming. How to interpret: Upcoming events should be explicitly incorporated into structure/expiration selection.",
+                    "Last Updated": "Source: MktScan persistence metadata. Definition: Most recent stored refresh time. How to interpret: Stale dates should be refreshed because earnings dates can move.",
+                    "Source": "Source: MktScan provenance. Definition: Upstream earnings-calendar provider. How to interpret: Current v2.5 earnings calendar uses Yahoo Finance.",
+                },
+                use_container_width=True,
+                hide_index=True,
+            )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # RESEARCH — one ticker, conclusion first, diagnostics on demand
