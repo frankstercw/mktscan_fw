@@ -13,6 +13,7 @@ import os
 import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -39,6 +40,7 @@ from mktscan.database import (
     seed_default_basket,
 )
 from mktscan.options import DISCLAIMER, generate_basket_setups
+from mktscan.on_demand import normalize_ticker, run_on_demand_review
 from mktscan.options_interpretation import interpret_options_market
 from mktscan.terminal import iv_state, semantic_signal, setup_quality
 from mktscan.trade_journal import close_trade, create_trade, mark_trade, trade_metrics
@@ -281,6 +283,109 @@ def live_treasury_yields() -> dict[str, dict]:
     return out
 
 
+
+@st.cache_data(ttl=900, show_spinner=False)
+def live_index_breadth() -> dict[str, dict]:
+    """Compute SPX and QQQ breadth as % of constituents trading above their 50-day SMA.
+
+    Constituents are sourced from public index-member tables and daily prices
+    are downloaded from Yahoo Finance. Cached for 15 minutes because breadth
+    does not need tick-level refresh.
+    """
+    import pandas as pd
+    import yfinance as yf
+
+    def _symbols(url: str, table_hint: str) -> list[str]:
+        tables = pd.read_html(url)
+        for frame in tables:
+            cols = {str(c).strip().lower(): c for c in frame.columns}
+            # S&P 500 table uses Symbol; Nasdaq-100 table typically uses Ticker.
+            for candidate in ("symbol", "ticker"):
+                if candidate in cols:
+                    vals = frame[cols[candidate]].dropna().astype(str).str.strip().tolist()
+                    if len(vals) >= 50:
+                        return [v.replace(".", "-") for v in vals]
+        raise ValueError(f"Could not find {table_hint} constituent table")
+
+    def _breadth(symbols: list[str]) -> dict:
+        raw = yf.download(
+            symbols,
+            period="4mo",
+            interval="1d",
+            auto_adjust=True,
+            progress=False,
+            threads=True,
+            group_by="column",
+        )
+        if raw.empty:
+            return {"pct_above_50d": None, "above": 0, "usable": 0, "state": "UNAVAILABLE"}
+
+        close = raw["Close"] if isinstance(raw.columns, pd.MultiIndex) and "Close" in raw.columns.get_level_values(0) else raw
+        above = 0
+        usable = 0
+        for symbol in symbols:
+            try:
+                s = close[symbol].dropna() if hasattr(close, "columns") else close.dropna()
+                if len(s) < 50:
+                    continue
+                last = float(s.iloc[-1])
+                ma50 = float(s.tail(50).mean())
+                usable += 1
+                above += int(last > ma50)
+            except Exception:
+                continue
+        pct = (above / usable * 100.0) if usable else None
+        state = "HEALTHY" if pct is not None and pct >= 60 else "WEAK" if pct is not None and pct < 40 else "MIXED" if pct is not None else "UNAVAILABLE"
+        return {"pct_above_50d": pct, "above": above, "usable": usable, "state": state}
+
+    out = {}
+    try:
+        spx = _symbols("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies", "S&P 500")
+        out["SPX"] = _breadth(spx)
+        out["SPX"]["source"] = "S&P 500 constituents (Wikipedia) + Yahoo Finance adjusted daily prices"
+    except Exception as exc:
+        out["SPX"] = {"pct_above_50d": None, "above": 0, "usable": 0, "state": "UNAVAILABLE", "error": str(exc)}
+
+    try:
+        qqq = _symbols("https://en.wikipedia.org/wiki/Nasdaq-100", "Nasdaq-100")
+        out["QQQ"] = _breadth(qqq)
+        out["QQQ"]["source"] = "Nasdaq-100 constituents (Wikipedia) + Yahoo Finance adjusted daily prices"
+    except Exception as exc:
+        out["QQQ"] = {"pct_above_50d": None, "above": 0, "usable": 0, "state": "UNAVAILABLE", "error": str(exc)}
+
+    return out
+
+
+def equity_market_state(regime, breadth: dict[str, dict]) -> dict[str, str]:
+    """Semantic equity-market summary used on Today."""
+    trend = "NEUTRAL"
+    momentum = "MIXED"
+    if regime:
+        spy_score = getattr(regime, "spy_trend_score", None)
+        qqq_score = getattr(regime, "qqq_trend_score", None)
+        vals = [float(v) for v in (spy_score, qqq_score) if v is not None]
+        avg = sum(vals) / len(vals) if vals else 0.0
+        trend = "BULLISH" if avg >= 0.20 else "BEARISH" if avg <= -0.20 else "NEUTRAL"
+
+        spy_m = getattr(regime, "spy_return_20d", None)
+        qqq_m = getattr(regime, "qqq_return_20d", None)
+        mvals = [float(v) for v in (spy_m, qqq_m) if v is not None]
+        mavg = sum(mvals) / len(mvals) if mvals else 0.0
+        momentum = "STRONG" if mavg >= 2.0 else "WEAK" if mavg <= -2.0 else "MIXED"
+
+    vals = [x.get("pct_above_50d") for x in breadth.values() if x.get("pct_above_50d") is not None]
+    bavg = sum(vals) / len(vals) if vals else None
+    breadth_state = "HEALTHY" if bavg is not None and bavg >= 60 else "WEAK" if bavg is not None and bavg < 40 else "MIXED" if bavg is not None else "UNAVAILABLE"
+
+    vix_state = "NORMAL"
+    if regime:
+        vix = getattr(regime, "vix", None)
+        if vix is not None:
+            vix_state = "STRESS" if float(vix) >= 30 else "ELEVATED" if float(vix) >= 22 else "NORMAL"
+
+    return {"Trend": trend, "Breadth": breadth_state, "VIX Structure": vix_state, "Momentum": momentum}
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def data_freshness() -> dict[str, datetime | None]:
     s = get_session()
@@ -328,6 +433,30 @@ def live_tradeability() -> dict:
         return compute_basket_tradeability(s)
     finally:
         s.close()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def on_demand_review(ticker: str, nonce: int = 0) -> dict:
+    """Ephemeral full MktScan review for a symbol outside the scheduled basket."""
+    s = get_session()
+    try:
+        return run_on_demand_review(s, ticker)
+    finally:
+        s.close()
+
+
+def _launch_custom_review():
+    """Safe callback: executes before widget creation on the rerun."""
+    try:
+        ticker = normalize_ticker(st.session_state.get("ticker_lookup", ""))
+    except ValueError as exc:
+        st.session_state["ticker_lookup_error"] = str(exc)
+        return
+    st.session_state.pop("ticker_lookup_error", None)
+    st.session_state["custom_ticker"] = ticker
+    st.session_state["global_ticker"] = ticker
+    st.session_state["area"] = "Research"
+    st.session_state["research_section"] = "Summary"
 
 
 @st.cache_data(ttl=120, show_spinner=False)
@@ -386,6 +515,12 @@ METRIC_HELP: dict[str, dict[str, str]] = {
     "Capital at Risk": {"source": "MktScan Trade Journal", "definition": "Sum of planned maximum loss across open positions.", "interpret": "Use it as a portfolio risk budget, not as a forecast of likely loss."},
     "10Y Treasury": {"source": "Yahoo Finance / CBOE ^TNX; fallback to MktScan regime snapshot", "definition": "Near-real-time U.S. 10-year Treasury yield proxy.", "interpret": "Rapidly rising long rates can pressure long-duration/growth equities; falling yields can ease valuation pressure. Watch the direction and basis-point change."},
     "30Y Treasury": {"source": "Yahoo Finance / CBOE ^TYX", "definition": "Near-real-time U.S. 30-year Treasury yield proxy.", "interpret": "Useful for tracking the long end of the curve and long-run growth/inflation expectations. Compare it with the 10Y and its daily change."},
+    "Equity Trend": {"source": "MktScan MarketRegimeSnapshot using SPY and QQQ trend components", "definition": "Broad equity trend state synthesized from SPY and QQQ trend scores.", "interpret": "BULLISH means the major equity benchmarks are broadly trend-supportive; BEARISH means the tape is a headwind for long momentum setups."},
+    "Equity Breadth": {"source": "MktScan SPX + QQQ breadth calculations", "definition": "Combined participation state based on the share of S&P 500 and Nasdaq-100 constituents above their 50-day moving averages.", "interpret": "HEALTHY (roughly ≥60%) means broad participation; MIXED (40–60%) means selective participation; WEAK (<40%) means a narrow/fragile tape."},
+    "SPX Breadth": {"source": "S&P 500 constituent list + Yahoo Finance adjusted daily prices", "definition": "Percentage of usable S&P 500 constituents trading above their 50-day simple moving average.", "interpret": "≥60% = healthy broad participation; 40–60% = mixed; <40% = weak. Rising breadth confirms index rallies; falling breadth can warn that gains are narrowing."},
+    "QQQ Breadth": {"source": "Nasdaq-100 constituent list + Yahoo Finance adjusted daily prices", "definition": "Percentage of usable Nasdaq-100 constituents trading above their 50-day simple moving average.", "interpret": "Especially relevant to growth/technology momentum. ≥60% is healthy, 40–60% mixed, <40% weak. Compare with QQQ price trend to detect narrow mega-cap leadership."},
+    "VIX Structure": {"source": "MktScan volatility regime / VIX market data", "definition": "Current equity-volatility state used in the Equity Market summary.", "interpret": "NORMAL supports ordinary risk-taking; ELEVATED calls for more caution; STRESS indicates unusually high equity volatility. A future VIX-term-structure feed can refine this further."},
+    "Equity Momentum": {"source": "MktScan MarketRegimeSnapshot using SPY/QQQ momentum", "definition": "Broad-market momentum state synthesized from recent SPY and QQQ returns.", "interpret": "STRONG supports continuation/momentum setups; MIXED means less confirmation; WEAK suggests deteriorating broad-market momentum."},
     "Setup": {"source": "MktScan setup-quality heuristic", "definition": "Qualitative ranking combining signal strength, regime alignment, IV context, event risk and technical state.", "interpret": "HIGH means several independent dimensions align; it is a prioritization aid, not a validated probability."},
     "Signal": {"source": "MktScan TradeabilityOutcome", "definition": "Semantic translation of the latest persisted tradeability score.", "interpret": "Bullish/bearish indicates direction; stronger labels indicate larger score magnitude."},
     "Score": {"source": "MktScan tradeability model", "definition": "Composite directional score, typically ranging from -1 to +1.", "interpret": "Positive favors bullish direction, negative favors bearish direction; compare magnitude and validation history rather than treating a cutoff as certainty."},
@@ -485,10 +620,16 @@ def build_decision(ticker: str, sig, regime, tech, opt, earn) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 # Global context + four-area navigation
 # ─────────────────────────────────────────────────────────────────────────────
-tickers = basket_tickers()
-if not tickers:
+basket_symbols = basket_tickers()
+if not basket_symbols:
     st.error("No basket tickers are configured.")
     st.stop()
+
+custom_ticker = st.session_state.get("custom_ticker")
+tickers = list(basket_symbols)
+if custom_ticker and custom_ticker not in tickers:
+    tickers.append(custom_ticker)
+
 if st.session_state.get("global_ticker") not in tickers:
     st.session_state["global_ticker"] = tickers[0]
 if st.session_state.get("area") not in {"Today", "Research", "Key Events", "Portfolio", "Validation"}:
@@ -497,6 +638,11 @@ if st.session_state.get("area") not in {"Today", "Research", "Key Events", "Port
 with st.sidebar:
     st.markdown("### ◈ MktScan")
     st.caption("Decision Terminal")
+    st.text_input("Analyze any ticker", key="ticker_lookup", placeholder="e.g. PLTR, JPM, BRK-B")
+    st.button("Run full review", type="primary", use_container_width=True, on_click=_launch_custom_review)
+    if st.session_state.get("ticker_lookup_error"):
+        st.error(st.session_state["ticker_lookup_error"])
+    st.caption("Ad-hoc symbols run on demand and are not added to the scheduled basket.")
     st.selectbox("Ticker", tickers, key="global_ticker")
     st.radio("", ["Today", "Research", "Key Events", "Portfolio", "Validation"], key="area", label_visibility="collapsed")
     st.divider()
@@ -560,6 +706,52 @@ if area == "Today":
         d30 = t30.get("delta_bps")
         card("30Y Treasury", f"{y30:.3f}%" if y30 is not None else "—", f"{d30:+.1f} bps vs prev close" if d30 is not None else "near-real-time")
 
+    with st.expander("Review a ticker outside the basket"):
+        st.caption("Use the sidebar **Analyze any ticker** box to run the full MktScan review without changing the scheduled basket.")
+
+    st.markdown('<div class="tv-section">Equity Market</div>', unsafe_allow_html=True)
+    with st.spinner("Updating SPX / QQQ breadth…"):
+        index_breadth = live_index_breadth()
+    eq_state = equity_market_state(regime, index_breadth)
+
+    spx_b = index_breadth.get("SPX", {})
+    qqq_b = index_breadth.get("QQQ", {})
+    spx_pct = spx_b.get("pct_above_50d")
+    qqq_pct = qqq_b.get("pct_above_50d")
+
+    equity_rows = pd.DataFrame([
+        {"Metric": "Trend", "Value": eq_state["Trend"]},
+        {"Metric": "Breadth", "Value": eq_state["Breadth"]},
+        {"Metric": "SPX Breadth", "Value": f"{spx_pct:.1f}% above 50DMA" if spx_pct is not None else "Unavailable"},
+        {"Metric": "QQQ Breadth", "Value": f"{qqq_pct:.1f}% above 50DMA" if qqq_pct is not None else "Unavailable"},
+        {"Metric": "VIX Structure", "Value": eq_state["VIX Structure"]},
+        {"Metric": "Momentum", "Value": eq_state["Momentum"]},
+    ])
+
+    # Table headers expose the interpretation framework; each metric also gets
+    # an explicit expandable tooltip-style help row so touch users do not rely
+    # on hover alone.
+    dataframe_with_help(
+        equity_rows,
+        help_overrides={
+            "Metric": "Each row is a market-state metric. Open the interpretation guide directly below for Source, Definition, and How to interpret each metric.",
+            "Value": "Current semantic state or breadth percentage. Breadth percentages represent constituents above their 50-day moving average.",
+        },
+        use_container_width=True,
+        hide_index=True,
+    )
+    with st.expander("ⓘ How to interpret Equity Market metrics"):
+        for label, help_key in [
+            ("Trend", "Equity Trend"),
+            ("Breadth", "Equity Breadth"),
+            ("SPX Breadth", "SPX Breadth"),
+            ("QQQ Breadth", "QQQ Breadth"),
+            ("VIX Structure", "VIX Structure"),
+            ("Momentum", "Equity Momentum"),
+        ]:
+            st.markdown(f"**{label}**")
+            st.caption(metric_help(help_key))
+
     st.markdown('<div class="tv-section">Top opportunities</div>', unsafe_allow_html=True)
     rows=[]
     for tk in tickers:
@@ -611,7 +803,28 @@ if area == "Today":
 # ─────────────────────────────────────────────────────────────────────────────
 elif area == "Key Events":
     st.markdown("## Key Events")
-    st.caption("Economic calendar and upcoming basket earnings in one calendar view. Event times are shown in UTC.")
+    st.caption("Major U.S. economic events from the MarketWatch economic calendar plus upcoming basket earnings. Event times are normalized to UTC.")
+
+    k1, k2 = st.columns([1, 3])
+    with k1:
+        if st.button("Refresh MarketWatch", use_container_width=True):
+            try:
+                from mktscan.scrapers.marketwatch import MarketWatchScraper
+                from mktscan.macro import upsert_macro_events
+                s = get_session()
+                try:
+                    with st.spinner("Refreshing MarketWatch economic calendar…"):
+                        events_now = MarketWatchScraper({"enabled": True}, delay=0.0).fetch_economic_calendar()
+                        saved = upsert_macro_events(s, events_now)
+                    st.success(f"MarketWatch: {len(events_now)} events refreshed ({saved} new).")
+                finally:
+                    s.close()
+                st.cache_data.clear()
+                st.rerun()
+            except Exception as exc:
+                st.error(f"MarketWatch refresh failed: {exc}")
+    with k2:
+        st.caption("The scheduler also refreshes this calendar during regular MktScan runs.")
 
     today = date.today()
     months = []
@@ -627,6 +840,17 @@ elif area == "Key Events":
     start_at = datetime(year, month, 1)
     end_at = datetime(year + 1, 1, 1) if month == 12 else datetime(year, month + 1, 1)
     events = key_events_between(start_at, end_at)
+    major_only = st.toggle(
+        "Major macro events only",
+        value=True,
+        help="Includes MarketWatch events classified High or Medium importance. Earnings are always retained.",
+    )
+    if major_only:
+        events = [
+            e for e in events
+            if e["kind"] == "EARN"
+            or str(e.get("importance") or "").upper() in {"HIGH", "MEDIUM"}
+        ]
     events_by_day: dict[int, list[dict]] = {}
     for e in events:
         events_by_day.setdefault(e["at"].day, []).append(e)
@@ -654,7 +878,12 @@ elif area == "Key Events":
                 day_events = events_by_day.get(day_num, [])
                 pills = []
                 for e in day_events[:4]:
-                    cls = "tv-warn" if e["kind"] == "ECON" else "tv-blue"
+                    if e["kind"] == "EARN":
+                        cls = "tv-blue"
+                    elif str(e.get("importance") or "").upper() == "HIGH":
+                        cls = "tv-bear"
+                    else:
+                        cls = "tv-warn"
                     label = (e["ticker"] if e["kind"] == "EARN" else e["title"])[:18]
                     pills.append(f"<div class='tv-pill {cls}' style='display:block;margin:4px 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap'>{e['kind']} · {label}</div>")
                 if len(day_events) > 4:
@@ -710,8 +939,56 @@ elif area == "Key Events":
 # RESEARCH — one ticker, conclusion first, diagnostics on demand
 # ─────────────────────────────────────────────────────────────────────────────
 elif area == "Research":
-    st.markdown(f"## {ticker} Research")
-    p=prices.get(ticker); sig=signals.get(ticker); opt=options.get(ticker); earn=earnings.get(ticker)
+    is_ad_hoc = ticker not in basket_symbols
+    review = None
+
+    if is_ad_hoc:
+        st.markdown(f"## {ticker} Research")
+        st.caption("On-demand MktScan review · not part of the scheduled basket")
+        try:
+            nonce = st.session_state.get("adhoc_nonce", 0)
+            with st.spinner(f"Running full MktScan review for {ticker}…"):
+                review = on_demand_review(ticker, nonce)
+        except Exception as exc:
+            st.error(f"Could not analyze {ticker}: {exc}")
+            st.info("Try another symbol or confirm that Yahoo Finance supports this ticker.")
+            st.stop()
+
+        pdict = review["price_data"]
+        p = SimpleNamespace(**pdict, snapped_at=datetime.utcnow())
+        td = review["tradeability"]
+        sig = SimpleNamespace(
+            score_at_prediction=float(td.get("score", 0.0)),
+            label_at_prediction=td.get("label", "NEUTRAL"),
+        )
+        opt = SimpleNamespace(**review["options_market"]) if review.get("options_market") else None
+
+        earn = None
+        now = datetime.utcnow()
+        upcoming = []
+        for ev in review.get("earnings", []):
+            rd = ev.get("report_date")
+            if rd and rd >= now:
+                upcoming.append(ev)
+        if upcoming:
+            ev = sorted(upcoming, key=lambda x: x.get("report_date"))[0]
+            earn = SimpleNamespace(**ev)
+
+        b1, b2 = st.columns([1, 5])
+        with b1:
+            if st.button("↻ Re-run review", use_container_width=True):
+                st.session_state["adhoc_nonce"] = st.session_state.get("adhoc_nonce", 0) + 1
+                st.rerun()
+        with b2:
+            st.caption(
+                f"Coverage {td.get('coverage', 0):.0%} · "
+                f"{review['sentiment'].get('article_count', 0)} unique news stories · "
+                "cross-sectional basket ranks are intentionally omitted for ad-hoc symbols"
+            )
+    else:
+        st.markdown(f"## {ticker} Research")
+        p=prices.get(ticker); sig=signals.get(ticker); opt=options.get(ticker); earn=earnings.get(ticker)
+
     price_txt=f"${p.price:,.2f}" if p and p.price is not None else "—"
     chg=float(p.change_pct) if p and p.change_pct is not None else None
     st.caption(f"{price_txt}" + (f" · {chg:+.2f}%" if chg is not None else "") + f" · price {age_text(p.snapped_at) if p else 'unavailable'}")
@@ -722,7 +999,7 @@ elif area == "Research":
 
     if section=="Summary":
         with st.spinner("Calculating technical opportunity…"):
-            tech=technical_opportunity(ticker)
+            tech=review["technical"] if review else technical_opportunity(ticker)
         decision=build_decision(ticker,sig,regime,tech,opt,earn)
         q=decision["quality"]
         st.markdown('<div class="tv-section">Decision summary</div>', unsafe_allow_html=True)
@@ -785,8 +1062,13 @@ elif area == "Research":
 
     elif section=="Options":
         if not opt:
-            st.info("No Options Market snapshot is stored for this ticker yet.")
+            if review and review.get("options_error"):
+                st.info(f"Options Market unavailable for {ticker}: {review['options_error']}")
+            else:
+                st.info("No Options Market snapshot is stored for this ticker yet.")
         else:
+            if review and opt.iv_percentile_1y is None:
+                st.caption("Ad-hoc ticker: live option surface is available, but IV Rank/Percentile needs stored historical IV observations.")
             score=float(sig.score_at_prediction) if sig else None
             interp=interpret_options_market(opt,score,sig.label_at_prediction if sig else None)
             c1,c2,c3,c4,c5=st.columns(5)
@@ -806,8 +1088,12 @@ elif area == "Research":
         st.caption("Expensive live chain access only runs when this view is opened.")
         try:
             with st.spinner("Loading current tradeability and option chain…"):
-                result=live_tradeability().get(ticker)
-                setup=generate_basket_setups({ticker:result},max_workers=1).get(ticker) if result else None
+                if review:
+                    result = review["tradeability"]
+                    setup = review.get("trade_setup")
+                else:
+                    result=live_tradeability().get(ticker)
+                    setup=generate_basket_setups({ticker:result},max_workers=1).get(ticker) if result else None
             if not setup or not setup.get("tradeable"):
                 st.warning((setup or {}).get("reason","No tradeable structure generated."))
             else:
@@ -830,7 +1116,7 @@ elif area == "Research":
     elif section=="ChatGPT Research":
         st.markdown("### ChatGPT research handoff")
         st.caption("MktScan remains the quantitative model. Use ChatGPT as a qualitative research and adversarial-review layer.")
-        tech=technical_opportunity(ticker)
+        tech=review["technical"] if review else technical_opportunity(ticker)
         score=float(sig.score_at_prediction) if sig else None
         preset=st.selectbox("Research task",["Challenge the thesis","Explain the move","Identify catalysts","Evaluate risks","Compare with peers","Earnings review"])
         context={
@@ -852,13 +1138,27 @@ elif area == "Research":
         st.info("Copy this prompt into ChatGPT. A direct API integration is intentionally not required for the dashboard to work.")
 
     elif section=="Advanced":
-        tech=technical_opportunity(ticker)
+        tech=review["technical"] if review else technical_opportunity(ticker)
         st.markdown("### Advanced diagnostics")
         dataframe_with_help(pd.DataFrame([tech.__dict__]),use_container_width=True,hide_index=True)
         if p:
-            st.markdown("#### Persisted price/fundamental snapshot")
+            st.markdown("#### Price/fundamental snapshot" if review else "#### Persisted price/fundamental snapshot")
             vals={k:v for k,v in p.__dict__.items() if not k.startswith("_")}
             st.json(vals,expanded=False)
+        if review:
+            st.markdown("#### On-demand signal categories")
+            cats = review["tradeability"].get("categories", {})
+            cat_rows = []
+            for name, data in cats.items():
+                cat_rows.append({
+                    "Category": name,
+                    "Score": data.get("score"),
+                    "Confidence": data.get("confidence"),
+                    "Detail": data.get("detail"),
+                })
+            dataframe_with_help(pd.DataFrame(cat_rows), use_container_width=True, hide_index=True)
+            st.markdown("#### On-demand news sentiment")
+            st.json(review.get("sentiment", {}), expanded=False)
         if opt:
             st.markdown("#### Raw options snapshot")
             vals={k:v for k,v in opt.__dict__.items() if not k.startswith("_")}

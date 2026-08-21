@@ -12,7 +12,8 @@ from __future__ import annotations
 import logging
 import re
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from typing import Any
 from urllib.parse import quote_plus
 
@@ -249,13 +250,23 @@ class MarketWatchScraper:
                 cell_texts = [c.get_text(strip=True) for c in cells]
 
                 # Identify columns heuristically based on cell count
-                if len(cell_texts) >= 5:
+                if len(cell_texts) >= 6:
+                    # Current MarketWatch schema:
+                    # Time (ET) | Report | Period | Actual | Forecast | Previous
                     time_str    = cell_texts[0]
                     event_name  = cell_texts[1]
                     period      = cell_texts[2]
+                    actual      = cell_texts[3]
+                    consensus   = cell_texts[4]
+                    prior       = cell_texts[5]
+                elif len(cell_texts) == 5:
+                    # Defensive fallback when one trailing column is omitted.
+                    time_str    = cell_texts[0]
+                    event_name  = cell_texts[1]
+                    period      = cell_texts[2]
+                    actual      = ""
                     consensus   = cell_texts[3]
                     prior       = cell_texts[4]
-                    actual      = cell_texts[5] if len(cell_texts) > 5 else ""
                 elif len(cell_texts) == 4:
                     time_str    = cell_texts[0]
                     event_name  = cell_texts[1]
@@ -366,30 +377,57 @@ class MarketWatchScraper:
                 pass
         return None
 
-    def _parse_date_header(self, text: str) -> datetime | None:
-        text = text.strip()
-        for fmt in (
-            "%A, %B %d, %Y", "%A, %b %d, %Y",
-            "%B %d, %Y",     "%b %d, %Y",
-            "%m/%d/%Y",      "%Y-%m-%d",
-        ):
+    def _parse_date_header(self, text: str):
+        """Parse MarketWatch date headers, including the common 'Monday, Aug. 17' form."""
+        text = re.sub(r"\s+", " ", text.strip())
+        candidates = (
+            ("%A, %B %d, %Y", text),
+            ("%A, %b %d, %Y", text.replace(".", "")),
+            ("%B %d, %Y", text),
+            ("%b %d, %Y", text.replace(".", "")),
+            ("%m/%d/%Y", text),
+            ("%Y-%m-%d", text),
+        )
+        for fmt, raw in candidates:
             try:
-                return datetime.strptime(text[:25], fmt).date()
+                return datetime.strptime(raw[:30], fmt).date()
+            except ValueError:
+                pass
+
+        # MarketWatch currently renders headers like "Monday, Aug. 17" without
+        # the year. Infer the year from today's date and handle Dec/Jan rollover.
+        raw = text.replace(".", "")
+        for fmt in ("%A, %b %d", "%b %d"):
+            try:
+                parsed = datetime.strptime(raw, fmt)
+                now = datetime.now()
+                year = now.year
+                candidate = parsed.replace(year=year).date()
+                # If the inferred date is implausibly far behind/ahead, assume
+                # the calendar window crossed a year boundary.
+                if (candidate - now.date()).days < -180:
+                    candidate = candidate.replace(year=year + 1)
+                elif (candidate - now.date()).days > 180:
+                    candidate = candidate.replace(year=year - 1)
+                return candidate
             except ValueError:
                 pass
         return None
 
     def _combine_datetime(self, date, time_str: str) -> datetime | None:
+        """Convert MarketWatch's ET calendar time into naive UTC for persistence."""
         if date is None:
             return None
-        time_str = time_str.strip().upper().replace("ET", "").strip()
+        cleaned = time_str.strip().upper().replace("ET", "").strip()
+        eastern = ZoneInfo("America/New_York")
         for fmt in ("%I:%M %p", "%I:%M%p", "%H:%M"):
             try:
-                t = datetime.strptime(time_str, fmt)
-                return datetime.combine(date, t.time())
+                t = datetime.strptime(cleaned, fmt)
+                local_dt = datetime.combine(date, t.time()).replace(tzinfo=eastern)
+                return local_dt.astimezone(timezone.utc).replace(tzinfo=None)
             except ValueError:
                 pass
-        # Return date-only if time parse fails
+        # Date-only events remain at midnight UTC when no reliable time exists.
         try:
             return datetime.combine(date, datetime.min.time())
         except Exception:

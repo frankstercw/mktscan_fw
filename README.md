@@ -561,3 +561,8 @@ Deploy schema changes with `alembic upgrade head` (migration `0004_trade_journal
 The dashboard now includes a decision-first **Today** page and a synchronized **Workspace** ticker context. Today compresses the basket into setup quality, semantic signal, confidence, IV state, regime, and event risk. Workspace combines technical opportunity (trend, momentum acceleration, relative strength, RVOL), an Alpaca intraday chart, Options Market interpretation, and the existing option trade builder. The Trade Journal adds model-vs-trader attribution and portfolio risk/concentration views.
 
 These presentation layers do not change the underlying tradeability model weights. Setup Quality is intentionally a workflow heuristic until journal/backtest evidence supports calibration.
+
+
+## Dashboard v2.2
+- MarketWatch major macro events on Key Events.
+- Full on-demand MktScan review for any supported ticker from the sidebar.
